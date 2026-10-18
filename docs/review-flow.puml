@@ -1,0 +1,271 @@
+@startuml
+' ============================================================================
+'  CodeReviewAgent - the full review flow, both platforms (feature 007)
+'
+'  Swimlanes: Developer, GitHub/TFS, Workflow, Agent, LLM.
+'  Both platform branches, story-source selection, chunk planning, per-chunk
+'  calls with their two kinds of retry, the synthesis pass, degraded paths,
+'  deduplication and DRY_RUN.
+'
+'  The notes carry a worked example. Its numbers are ILLUSTRATIVE - issue #7,
+'  PR #12, four files, two chunks - chosen to show every branch once, not taken
+'  from a recorded run. A real default-budget review of four files is one call.
+'
+'  Render with:
+'    java -jar plantuml.jar -tsvg docs/review-flow.puml
+'  SVG, not PNG: the PNG writer truncates tall diagrams at 4096px without
+'  warning unless -DPLANTUML_LIMIT_SIZE=8192 is passed.
+'  Graphviz is not required (modern activity syntax).
+'
+'  Owners of each stage are named in [brackets]; docs/code-structure.md has
+'  every file. The local-mode, TFS-only view is docs/local-mode-pr-review-activity.puml.
+' ============================================================================
+
+title AI code review - full flow (TFS and GitHub)\n<size:11>PLATFORM=tfs|github  -  STORY_SOURCE=tfs|github-issues|none  -  DRY_RUN defaults to true</size>
+
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam ActivityFontSize 12
+skinparam ActivityDiamondFontSize 11
+skinparam ActivityBorderThickness 1
+
+|Developer|
+start
+:Open or push to a pull request;
+note right
+  **Example**: issue #7 "Add item to cart"
+  with 3 acceptance criteria.
+  PR #12 says "Closes #7" and changes 4 files:
+  Interfaces.cs, CartService.cs,
+  CartController.cs, Cart.cs
+end note
+
+|GitHub/TFS|
+if (Platform?) then (GitHub)
+  :pull_request event: opened, synchronize,
+  reopened or ready_for_review;
+  |Workflow|
+  if (Draft PR, or head repo is a fork?) then (yes)
+    :job **skipped** prints the reason;
+    note right
+      Never pull_request_target:
+      fork code never sees secrets.
+    end note
+    stop
+  else (no)
+  endif
+  :concurrency group per PR:
+  a newer commit **cancels** the older run;
+  :check out the agent at agent_ref,
+  pip install, then
+  ""python -m review_agent --local""
+  with GITHUB_TOKEN (permissions:
+  contents read, PRs + issues write);
+else (TFS)
+  :branch-policy build, or a manual run
+  (""TFS_API_VERSION=5.0"" on this server);
+  |Agent|
+  :bootstrap: fetch the agent repository
+  and re-run inside it, unless --local
+  [bootstrap.py, source_fetch.py];
+endif
+
+|Agent|
+:load_config: PLATFORM picks the settings
+that are required; every problem at once
+[config.py];
+if (Configuration valid?) then (no)
+  :print every problem;
+  :exit **2** (setup failure);
+  stop
+else (yes)
+endif
+
+:make_platform: TfsPlatform over TfsClient,
+or GitHubClient (a posting client is built
+**only** when DRY_RUN=false)
+[platform.py, github_client.py];
+
+|GitHub/TFS|
+:read the pull request;
+|Agent|
+switch (STORY_SOURCE)
+case (tfs)
+  |GitHub/TFS|
+  :linked work items;
+case (github-issues)
+  |GitHub/TFS|
+  :GraphQL closingIssuesReferences
+  + "Closes #N" in the body,
+  deduplicated, this repo only;
+  :read each issue;
+  |Agent|
+  :criteria from "## Acceptance criteria"
+  [stories.py, models.py];
+  note right
+    **Example**: #7 yields criteria 1-3,
+    keyed wi7:c1 .. wi7:c3
+  end note
+case (none)
+  |Agent|
+  :checklist-only review, said so;
+endswitch
+|Agent|
+if (Story readable?) then (no: 403)
+  :story half lost, **stated**;
+  note right: the review continues
+else (yes)
+endif
+
+:checklist corpus: clone the checklist repo,
+read every .xlsx / .docx into citable rules
+[checklist.py, checklist_docs.py];
+
+|GitHub/TFS|
+:revision: TFS iteration, or GitHub head
+and **merge base** (compare API);
+:changed files (every page) and blobs;
+|Agent|
+:unified diffs; exclusions and bounds,
+each skipped file with its reason
+[diff_builder.py, selection.py];
+|GitHub/TFS|
+:read the agent's prior comments
+(ai-review: markers);
+|Agent|
+
+if (Anything reviewable?) then (no)
+  :summary "nothing to review";
+else (yes)
+  :plan chunks by **token budget**
+  (LLM_MAX_PROMPT_TOKENS, default 120,000),
+  group related files; cut oversized files
+  on hunks, each piece with a skeleton
+  [chunk_planner.py, declarations.py];
+  note right
+    **Example**: budget lowered so the
+    planner makes **2 chunks**:
+    1: Interfaces.cs + CartService.cs
+    2: CartController.cs + Cart.cs
+    The outline in BOTH lists
+    removed  AddItem(int, int)
+    added    AddItem(int, int, string)
+  end note
+  :build one prompt per chunk:
+  rules, contract, story, scope, checklist,
+  **PR outline**, the chunk's diff
+  [prompt_builder.py];
+
+  repeat :next chunk;
+    |LLM|
+    :review the chunk;
+    |Agent|
+    if (HTTP 429 / 5xx / timeout?) then (yes)
+      :transport retry (up to 3 sends),
+      each send logged with its tokens
+      [llm_adapter.py, llm_log.py];
+    else (no)
+    endif
+    if (Response matches the contract?) then (no)
+      :one stricter retry;
+      if (Still no?) then (yes)
+        :degraded summary posted;
+        :exit **0** - an outage
+        never gates a merge;
+        stop
+      else (no)
+      endif
+    else (yes)
+    endif
+  repeat while (More chunks?) is (yes)
+  ->no;
+
+  :merge chunk findings and change notes
+  [parser.py];
+  if (More than one chunk?) then (yes)
+    |LLM|
+    :**synthesis**: outline + merged findings
+    + notes + criteria -> one summary,
+    final verdicts, cross_file_issues;
+    |Agent|
+    if (Synthesis usable?) then (yes)
+      :apply verdicts and cross-file issues;
+    else (no)
+      :keep the chunk findings,
+      **note** "synthesis did not complete";
+    endif
+    note right
+      **Example**: chunk 2 saw
+      CartController still calling
+      AddItem(productId, quantity).
+      Synthesis reports ONE cross-file
+      issue naming Interfaces.cs and
+      CartController.cs
+    end note
+  else (no)
+  endif
+  :build the report; usage line:
+  tokens and estimated cost
+  [parser.py, llm_log.py];
+endif
+
+:route findings: anchored to a changed line
+-> inline; otherwise -> summary only.
+Drop any whose marker was already posted
+[output_layer.py, dedupe.py];
+note right
+  **Example**: 1 cross-file issue (inline
+  on CartController.cs), 1 checklist
+  violation (inline), criteria table:
+  1 appears addressed, 2 not addressed
+  (neutral, no comment), 3 possible
+  contradiction
+end note
+
+if (DRY_RUN?) then (true - the default)
+  :print exactly what would be posted;
+else (false)
+  |GitHub/TFS|
+  if (Platform?) then (GitHub)
+    :summary: one issue comment,
+    edited in place on re-runs;
+    :ONE review (event COMMENT) with
+    every inline comment;
+    if (HTTP 422: an anchor refused?) then (yes)
+      :re-post the review listing each
+      finding and its location instead;
+    else (no)
+    endif
+  else (TFS)
+    :summary thread (PATCH in place,
+    or append); one thread per inline;
+  endif
+endif
+
+|Workflow|
+if (llm_log input?) then (true)
+  :upload the log as an artifact,
+  3-day retention (contains source code);
+else (false)
+endif
+
+|Agent|
+if (FAIL_ON_CONTRADICTION and blocking findings?) then (yes)
+  :exit **1**;
+else (no)
+  :exit **0**;
+endif
+note right
+  **Example re-run**: same commit ->
+  suppressed=2 inline=0,
+  summary edited in place
+end note
+stop
+
+legend bottom
+  Exit codes: 0 reviewed or degraded | 1 blocking findings (FAIL_ON_CONTRADICTION only) | 2 setup failure
+  Worked-example numbers are illustrative. Detail: docs/code-structure.md, docs/github-setup.md
+endlegend
+@enduml

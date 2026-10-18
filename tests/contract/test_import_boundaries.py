@@ -12,7 +12,7 @@ from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parents[2] / "review_agent"
 
-MAY_IMPORT_REQUESTS = {"tfs_client.py", "llm_adapter.py"}
+MAY_IMPORT_REQUESTS = {"tfs_client.py", "llm_adapter.py", "github_client.py"}  # 007: GitHub
 MAY_READ_ENVIRONMENT = {"config.py", "main.py"}  # main.py only for its sys.path bootstrap
 
 
@@ -211,3 +211,30 @@ def test_the_log_module_knows_nothing_it_should_not():
     imported = _imported_modules(AGENT_DIR / "llm_log.py")
     for forbidden in ("requests", "subprocess", "openpyxl", "zipfile"):
         assert forbidden not in imported
+
+
+# --------------------------------------------------------------------------
+# T012 (feature 007): the modules this feature adds are pure.
+#
+# Planning, declaration extraction, story selection and the platform seam are
+# all things the pipeline needs and none of them may reach the network, run a
+# child process, or read the environment. Each is asserted once it exists, so
+# this test tightens as the feature lands.
+# --------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+PURE_007_MODULES = ("platform.py", "stories.py", "declarations.py", "chunk_planner.py")
+
+
+@pytest.mark.parametrize("name", PURE_007_MODULES)
+def test_feature_007_modules_reach_nothing_outside_themselves(name):
+    path = AGENT_DIR / name
+    if not path.exists():
+        pytest.skip(f"{name} not written yet")
+    imported = _imported_modules(path)
+    text = path.read_text(encoding="utf-8")
+    assert "requests" not in imported, f"{name} imports requests"
+    assert "subprocess" not in imported, f"{name} imports subprocess"
+    assert re.search(r"os\.environ|os\.getenv|getenv\(", text) is None, f"{name} reads the environment"
+    assert re.search(r"[\"']git[\"']", text) is None, f"{name} invokes git"

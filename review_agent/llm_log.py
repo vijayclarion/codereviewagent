@@ -100,8 +100,23 @@ class ExchangeRecord:
     outcome: str = "ok"
     response: str = ""
     failure: str = ""
+    # Feature 007: a review chunk, or the one synthesis call of a multi-chunk run.
+    kind: str = "review"
+    #: Which HTTP attempt inside `call_llm` this was - a transport resend is
+    #: an exchange of its own, because it was sent (FR-021).
+    send: int = 1
+    provider: str = ""
+    model: str = ""
+    #: As reported by the provider. None means "not reported" - never 0, and
+    #: never an estimate presented as real (FR-022).
+    input_tokens: object = None
+    output_tokens: object = None
 
     def __post_init__(self):
+        if self.kind not in ("review", "synthesis"):
+            raise ValueError(f"unknown exchange kind: {self.kind!r}")
+        if not 1 <= self.send <= 3:
+            raise ValueError("a send is one of at most three transport attempts")
         if self.outcome not in ("ok", "failed"):
             raise ValueError(f"unknown exchange outcome: {self.outcome!r}")
         if self.outcome == "failed" and not self.failure:
@@ -112,7 +127,9 @@ class ExchangeRecord:
             raise ValueError("a successful exchange has no failure reason")
         if self.attempt not in (1, 2):
             raise ValueError("an exchange is a first send or its one retry")
-        if self.chunk < 1 or self.chunk_total < 1 or self.chunk > self.chunk_total:
+        if self.kind == "review" and (
+            self.chunk < 1 or self.chunk_total < 1 or self.chunk > self.chunk_total
+        ):
             raise ValueError("chunk position outside the run's chunks")
 
 
@@ -216,14 +233,18 @@ class LogSession:
             lambda: _write(self.path, _render(record)), "write a log entry"
         )
 
-    def close(self, outcome):
+    def close(self, outcome, usage=None):
         """The closing summary. A run that is killed never reaches this, and
-        the missing line is how a reader knows it did not finish (FR-010b)."""
+        the missing line is how a reader knows it did not finish (FR-010b).
+
+        Feature 007: the run's usage goes on its own line BEFORE the end line,
+        which keeps the end line's text exactly as 006 defined it."""
         if not self.enabled:
             return
         plural = "" if self.count == 1 else "s"
         foot = (
-            _rule(
+            (f"usage    : {usage.describe()}\n" if usage is not None else "")
+            + _rule(
                 f"=== end | {self.count} exchange{plural} | outcome {outcome}", "="
             )
             + "\n"
@@ -236,7 +257,7 @@ class LogSession:
         """Run `action`; on any failure say so once and go quiet for good."""
         try:
             action()
-        except OSError as exc:
+        except Exception as exc:  # feature 007: anything at all, not only OSError
             self.enabled = False
             emit(f"llm log: could not {what} - {type(exc).__name__}: {exc}")
 
@@ -248,14 +269,89 @@ def disabled_session():
     return LogSession(enabled=False)
 
 
+def _tokens_line(input_tokens, output_tokens):
+    if input_tokens is None and output_tokens is None:
+        return "tokens   : not reported"
+
+    def _side(value):
+        return "not reported" if value is None else _count(value)
+
+    return (
+        f"tokens   : input {_side(input_tokens)} | output {_side(output_tokens)} "
+        "(reported by provider)"
+    )
+
+
+class RunUsage:
+    """Tokens and estimated cost for one run (feature 007, D15).
+
+    Accumulated whether or not logging is on: cost visibility is not opt-in.
+    Only provider-reported counts are summed; a send that reported none makes
+    the total "partial", and says by how much.
+    """
+
+    def __init__(self, price_input=None, price_output=None, currency="USD"):
+        self.price_input = price_input
+        self.price_output = price_output
+        self.currency = currency or "USD"
+        self.calls = 0
+        self.reported = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    @classmethod
+    def for_config(cls, config):
+        return cls(
+            getattr(config, "llm_price_input_per_mtok", None),
+            getattr(config, "llm_price_output_per_mtok", None),
+            getattr(config, "llm_price_currency", "USD"),
+        )
+
+    def add(self, input_tokens=None, output_tokens=None):
+        self.calls += 1
+        if input_tokens is None and output_tokens is None:
+            return
+        self.reported += 1
+        self.input_tokens += int(input_tokens or 0)
+        self.output_tokens += int(output_tokens or 0)
+
+    @property
+    def cost(self):
+        if self.price_input is None or self.price_output is None:
+            return None
+        return (
+            self.input_tokens / 1_000_000 * self.price_input
+            + self.output_tokens / 1_000_000 * self.price_output
+        )
+
+    def describe(self):
+        if not self.calls:
+            return "no exchange"
+        cost = self.cost
+        text = (
+            f"input {_count(self.input_tokens)} · output {_count(self.output_tokens)} · "
+            + (f"cost {cost:.4f} {self.currency}" if cost is not None
+               else "cost not estimated (no LLM_PRICE_* set)")
+        )
+        if self.reported < self.calls:
+            text += f" · partial — {self.reported} of {self.calls} calls reported usage"
+        return text
+
+
 def _render(record):
     """One entry, per contracts/log-format.md."""
-    header = _rule(
-        f"--- exchange {record.index} of {record.chunk_total} "
-        f"| chunk {record.chunk} of {record.chunk_total} "
-        f"| attempt {record.attempt}",
-        "-",
-    )
+    if record.kind == "synthesis":
+        position = f"--- exchange {record.index} | synthesis | attempt {record.attempt}"
+    else:
+        position = (
+            f"--- exchange {record.index} of {record.chunk_total} "
+            f"| chunk {record.chunk} of {record.chunk_total} "
+            f"| attempt {record.attempt}"
+        )
+    if record.send > 1:
+        # Only a resend says so: a first send's header is byte-identical to 006's.
+        position += f" | send {record.send} of 3"
+    header = _rule(position, "-")
     body_rule = "- " * ((RULE_WIDTH - 1) // 2) + "-"
     if record.outcome == "ok":
         outcome = (
@@ -266,15 +362,18 @@ def _render(record):
     else:
         outcome = f"outcome  : failed in {_count(record.elapsed_ms)} ms"
         tail = record.failure
+    head = [header, f"sent     : {record.sent_at}"]
+    if record.provider or record.model:
+        head.append(f"model    : {record.provider or '-'} / {record.model or '-'}")
     return "\n".join(
-        [
-            header,
-            f"sent     : {record.sent_at}",
+        head
+        + [
             f"prompt   : {_count(len(record.prompt))} characters",
             body_rule,
             record.prompt,
             body_rule,
             outcome,
+            _tokens_line(record.input_tokens, record.output_tokens),
             body_rule,
             tail,
             "",
@@ -340,6 +439,9 @@ def open_session(config, provider="", model="", agent_source="", now=None):
         return disabled_session()
 
     started = now or datetime.now()
+    # Feature 007: `pr_id` is platform-neutral; a test's stand-in config may
+    # still carry only the TFS name.
+    pr_id = getattr(config, "pr_id", None) or getattr(config, "tfs_pr_id", 0)
     try:
         destination = LogDestination(config.llm_log_dir, config.llm_log_keep)
         os.makedirs(destination.directory, exist_ok=True)
@@ -352,13 +454,13 @@ def open_session(config, provider="", model="", agent_source="", now=None):
         emit(f"llm log: {problem}")
 
     try:
-        path = destination.path_for(config.tfs_pr_id, started)
+        path = destination.path_for(pr_id, started)
     except OSError as exc:
         emit(f"llm log: disabled - {type(exc).__name__}: {exc}")
         return disabled_session()
 
     session = LogSession(
-        path=path, pr_id=config.tfs_pr_id, started=started, enabled=True
+        path=path, pr_id=pr_id, started=started, enabled=True
     )
     session.head(provider=provider, model=model, agent_source=agent_source)
     if not session.enabled:

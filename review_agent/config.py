@@ -10,6 +10,7 @@ cannot escape through an exception message or a stray repr (FR-006, research R8)
 """
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field, fields
 from urllib.parse import urlparse
@@ -103,6 +104,14 @@ _TRUE = {"true", "1", "yes", "on"}
 _FALSE = {"false", "0", "no", "off"}
 
 PROVIDERS = ("claude", "openai", "azure", "ollama")
+
+#: Feature 007. Where pull requests live, and where their stories come from.
+PLATFORMS = ("tfs", "github")
+STORY_SOURCES = ("tfs", "github-issues", "none")
+NATIVE_STORY_SOURCE = {"tfs": "tfs", "github": "github-issues"}
+
+DEFAULT_GH_API_URL = "https://api.github.com"
+_GH_REPOSITORY = re.compile(r"^[\w.-]+/[\w.-]+$")
 KEYLESS_PROVIDERS = ("ollama",)
 BASE_URL_REQUIRED = ("azure", "ollama")
 
@@ -184,6 +193,21 @@ def _parse_int(raw, name, problems, default, minimum=1):
     return value
 
 
+def _parse_price(raw, name, problems):
+    """A non-negative decimal, or None when unset (feature 007, D15)."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        problems.add(f"{name} must be a number (got {raw!r})")
+        return None
+    if value < 0:
+        problems.add(f"{name} must be >= 0 (got {value})")
+        return None
+    return value
+
+
 def derive_repo_name(url):
     """Pull the repository name out of a TFS git URL.
 
@@ -253,8 +277,34 @@ class Config:
     llm_log: bool = False
     llm_log_dir: str = ""
     llm_log_keep: int = 10
+    # Feature 007: the second platform. On GitHub the TFS fields above stay
+    # empty, and `checklist_repo` / `agent_repo` carry `owner/name`.
+    platform: str = "tfs"
+    story_source: str = "tfs"
+    gh_api_url: str = DEFAULT_GH_API_URL
+    gh_repository: str = ""
+    gh_pr_number: int = 0
+    gh_token: str = field(default="", repr=False)
+    gh_post_token: str = field(default="", repr=False)
+    gh_checklist_token: str = field(default="", repr=False)
+    gh_checklist_repo: str = ""
+    gh_agent_repo: str = ""
+    # Feature 007: the budget is tokens for a whole prompt, not lines of diff.
+    # `llm_max_chunk_lines` survives as an optional extra cap - 0 means none.
+    llm_max_prompt_tokens: int = 120000
+    llm_max_output_tokens: int = 8192
+    llm_price_input_per_mtok: object = None
+    llm_price_output_per_mtok: object = None
+    llm_price_currency: str = "USD"
 
-    SECRET_FIELDS = ("tfs_token", "llm_api_key", "post_token")
+    SECRET_FIELDS = (
+        "tfs_token",
+        "llm_api_key",
+        "post_token",
+        "gh_token",
+        "gh_post_token",
+        "gh_checklist_token",
+    )
 
     def __repr__(self):
         parts = []
@@ -269,6 +319,32 @@ class Config:
     def api_root(self):
         return f"{self.tfs_base_url}/{self.tfs_project}/_apis"
 
+    @property
+    def pr_id(self):
+        """The pull request under review, whichever platform holds it."""
+        return self.gh_pr_number if self.platform == "github" else self.tfs_pr_id
+
+    @property
+    def gh_web_url(self):
+        """The git/web host behind `gh_api_url`.
+
+        github.com's API lives on its own host; GitHub Enterprise Server's
+        lives under `/api/v3` on the same host as the web interface.
+        """
+        api = (self.gh_api_url or DEFAULT_GH_API_URL).rstrip("/")
+        if api == DEFAULT_GH_API_URL:
+            return "https://github.com"
+        if api.endswith("/api/v3"):
+            return api[: -len("/api/v3")]
+        return api
+
+    @property
+    def gh_graphql_url(self):
+        api = (self.gh_api_url or DEFAULT_GH_API_URL).rstrip("/")
+        if api == DEFAULT_GH_API_URL:
+            return f"{DEFAULT_GH_API_URL}/graphql"
+        return f"{self.gh_web_url}/api/graphql"
+
 
 def _env(name, default=None):
     value = os.environ.get(name)
@@ -279,7 +355,17 @@ def _env(name, default=None):
 
 #: Environment variables that carry a credential into this process. A child that
 #: does not need one must not inherit it.
-SECRET_ENV_NAMES = ("TFS_PAT", "TFS_PAT_FOR_PR", "LLM_API_KEY")
+SECRET_ENV_NAMES = (
+    "TFS_PAT",
+    "TFS_PAT_FOR_PR",
+    "LLM_API_KEY",
+    # Feature 007.
+    "GH_TOKEN",
+    "GH_TOKEN_FOR_PR",
+    "GH_CHECKLIST_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_REPO_TOKEN",
+)
 
 
 def child_environment(overrides=None, drop_secrets=False):
@@ -372,52 +458,107 @@ def load_config(
     load_dotenv_if_present(repo_root)
     problems = _Problems()
 
-    # Pipeline variables take precedence over their .env equivalents.
-    base_url = _env("TFS_BASE_URL") or _env("SYSTEM_TEAMFOUNDATIONCOLLECTIONURI")
-    project = _env("TFS_PROJECT") or _env("SYSTEM_TEAMPROJECT")
-    # Feature 002 (R10): the provisioned .env names are canonical; the 001 names
-    # remain accepted aliases so existing configurations keep working. Renaming
-    # would have broken the only working configuration on the developer's machine.
-    repo = (
-        _env("TFS_REPO_CODE_SAMPLE")
-        or _env("TFS_REPO")
-        or _env("BUILD_REPOSITORY_NAME")
-    )
-    raw_pr = _env("TFS_PR_ID") or _env("SYSTEM_PULLREQUEST_PULLREQUESTID")
+    # Feature 007: which platform. Everything below that is platform-specific
+    # is required ONLY for the platform in use, so a TFS run never needs a
+    # GitHub setting and the reverse - and a TFS run reads exactly what it
+    # read before this feature, with the same messages.
+    platform = (_env("PLATFORM") or "tfs").lower()
+    if platform not in PLATFORMS:
+        problems.add(f"PLATFORM must be one of {'/'.join(PLATFORMS)} (got {platform!r})")
+        platform = "tfs"
+    on_github = platform == "github"
 
-    if base_url:
-        base_url = base_url.rstrip("/")
-    else:
-        problems.add("TFS_BASE_URL is required")
-    if not project:
-        problems.add("TFS_PROJECT is required")
-    if not repo:
-        problems.add("TFS_REPO_CODE_SAMPLE is required (alias: TFS_REPO)")
-
+    base_url = project = repo = None
     pr_id = 0
-    if pr_id_override is not None:
-        pr_id = pr_id_override
-    elif raw_pr:
-        pr_id = _parse_int(raw_pr, "TFS_PR_ID", problems, 0, minimum=1)
-    else:
-        problems.add("TFS_PR_ID is required")
+    auth_mode, token = "basic", ""
+    gh = {
+        "api_url": DEFAULT_GH_API_URL,
+        "repository": "",
+        "pr_number": 0,
+        "token": "",
+        "post_token": "",
+        "checklist_token": "",
+        "checklist_repo": "",
+        "agent_repo": "",
+    }
 
-    # Auth. An empty-string pipeline token counts as absent - that is exactly
-    # what a job without "Allow scripts to access the OAuth token" exports, and
-    # treating it as present produces a baffling redirect instead of this
-    # message (research R2).
-    pipeline_token = _env("SYSTEM_ACCESSTOKEN")
-    pat = _env("TFS_PAT")
-    if pipeline_token:
-        auth_mode, token = "bearer", pipeline_token
-    elif pat:
-        auth_mode, token = "basic", pat
-    else:
-        auth_mode, token = "basic", ""
-        problems.add(
-            "no usable credential: set SYSTEM_ACCESSTOKEN (pipeline) or TFS_PAT (manual)"
+    if not on_github:
+        # Pipeline variables take precedence over their .env equivalents.
+        base_url = _env("TFS_BASE_URL") or _env("SYSTEM_TEAMFOUNDATIONCOLLECTIONURI")
+        project = _env("TFS_PROJECT") or _env("SYSTEM_TEAMPROJECT")
+        # Feature 002 (R10): the provisioned .env names are canonical; the 001 names
+        # remain accepted aliases so existing configurations keep working. Renaming
+        # would have broken the only working configuration on the developer's machine.
+        repo = (
+            _env("TFS_REPO_CODE_SAMPLE")
+            or _env("TFS_REPO")
+            or _env("BUILD_REPOSITORY_NAME")
         )
-    register_secret(token)
+        raw_pr = _env("TFS_PR_ID") or _env("SYSTEM_PULLREQUEST_PULLREQUESTID")
+
+        if base_url:
+            base_url = base_url.rstrip("/")
+        else:
+            problems.add("TFS_BASE_URL is required")
+        if not project:
+            problems.add("TFS_PROJECT is required")
+        if not repo:
+            problems.add("TFS_REPO_CODE_SAMPLE is required (alias: TFS_REPO)")
+
+        if pr_id_override is not None:
+            pr_id = pr_id_override
+        elif raw_pr:
+            pr_id = _parse_int(raw_pr, "TFS_PR_ID", problems, 0, minimum=1)
+        else:
+            problems.add("TFS_PR_ID is required")
+
+        # Auth. An empty-string pipeline token counts as absent - that is exactly
+        # what a job without "Allow scripts to access the OAuth token" exports, and
+        # treating it as present produces a baffling redirect instead of this
+        # message (research R2).
+        pipeline_token = _env("SYSTEM_ACCESSTOKEN")
+        pat = _env("TFS_PAT")
+        if pipeline_token:
+            auth_mode, token = "bearer", pipeline_token
+        elif pat:
+            auth_mode, token = "basic", pat
+        else:
+            auth_mode, token = "basic", ""
+            problems.add(
+                "no usable credential: set SYSTEM_ACCESSTOKEN (pipeline) or TFS_PAT (manual)"
+            )
+        register_secret(token)
+    else:
+        gh["api_url"] = (
+            _env("GH_API_URL") or _env("GITHUB_API_URL") or DEFAULT_GH_API_URL
+        ).rstrip("/")
+        gh["repository"] = _env("GH_REPOSITORY") or _env("GITHUB_REPOSITORY") or ""
+        if not gh["repository"]:
+            problems.add("GH_REPOSITORY is required (owner/name; alias: GITHUB_REPOSITORY)")
+        elif not _GH_REPOSITORY.match(gh["repository"]):
+            problems.add(f"GH_REPOSITORY must be owner/name (got {gh['repository']!r})")
+
+        if pr_id_override is not None:
+            gh["pr_number"] = pr_id_override
+        elif _env("GH_PR_NUMBER"):
+            gh["pr_number"] = _parse_int(_env("GH_PR_NUMBER"), "GH_PR_NUMBER", problems, 0)
+        else:
+            problems.add("GH_PR_NUMBER is required (or pass --pr)")
+
+        # GIT_REPO_TOKEN is the name the requester's own .env uses; GITHUB_TOKEN
+        # is what a workflow step usually exports. GH_TOKEN wins over both.
+        gh["token"] = _env("GH_TOKEN") or _env("GITHUB_TOKEN") or _env("GIT_REPO_TOKEN") or ""
+        if not gh["token"]:
+            problems.add(
+                "GH_TOKEN is required to read the pull request "
+                "(aliases: GITHUB_TOKEN, GIT_REPO_TOKEN)"
+            )
+        gh["checklist_token"] = _env("GH_CHECKLIST_TOKEN") or gh["token"]
+        gh["checklist_repo"] = _env("GH_CHECKLIST_REPO") or ""
+        gh["agent_repo"] = _env("GH_AGENT_REPO") or ""
+        auth_mode, token = "bearer", ""
+        register_secret(gh["token"])
+        register_secret(gh["checklist_token"])
 
     provider = (_env("LLM_PROVIDER") or "").lower()
     if not provider:
@@ -439,18 +580,31 @@ def load_config(
         problems.add(f"LLM_BASE_URL is required for LLM_PROVIDER={provider}")
 
     checklist_repo, checklist_setting = _resolve_checklist_repo()
+    if on_github and gh["checklist_repo"]:
+        checklist_repo, checklist_setting = gh["checklist_repo"], "GH_CHECKLIST_REPO"
 
     # Feature 002: the agent repository is fetched and executed on every run, so
     # that a review always reflects the latest committed logic (FR-012). The
     # --local override is the only way to review with an unfetched copy.
-    agent_repo = _env("TFS_REPO_CODE_REVIEW_CodeReviewAgent") or ""
+    agent_setting = "GH_AGENT_REPO" if on_github else "TFS_REPO_CODE_REVIEW_CodeReviewAgent"
+    agent_repo = (gh["agent_repo"] if on_github else _env(agent_setting)) or ""
     agent_ref = _env("AGENT_REF") or "master"
     local_logic = bool(local_logic_override)
     bootstrapped_sha = _env("REVIEW_AGENT_BOOTSTRAPPED") or ""
     if not agent_repo and not local_logic and not bootstrapped_sha:
+        problems.add(f"{agent_setting} is required (or run with --local)")
+
+    # Feature 007: the story source, defaulting to the platform's own.
+    story_source = (_env("STORY_SOURCE") or NATIVE_STORY_SOURCE[platform]).lower()
+    if story_source not in STORY_SOURCES:
         problems.add(
-            "TFS_REPO_CODE_REVIEW_CodeReviewAgent is required (or run with --local)"
+            f"STORY_SOURCE must be one of {'/'.join(STORY_SOURCES)} (got {story_source!r})"
         )
+        story_source = NATIVE_STORY_SOURCE[platform]
+    elif story_source == "github-issues" and not on_github:
+        problems.add("STORY_SOURCE=github-issues requires PLATFORM=github")
+    elif story_source == "tfs" and on_github:
+        problems.add("STORY_SOURCE=tfs requires PLATFORM=tfs")
 
     exclude_raw = _env("REVIEW_EXCLUDE_PATTERNS") or ""
     extra = tuple(p.strip() for p in exclude_raw.split(",") if p.strip())
@@ -469,10 +623,17 @@ def load_config(
     # Feature 002 (FR-006, FR-008): a separate credential for posting, required
     # only by a run that will actually post. A dry run must succeed without it -
     # that is what makes "a preview cannot write" a property rather than a promise.
-    post_token = _env("TFS_PAT_FOR_PR") or ""
-    register_secret(post_token)
-    if not dry_run and not post_token:
-        problems.add("TFS_PAT_FOR_PR is required to post (omit --post for a dry run)")
+    post_token = ""
+    if not on_github:
+        post_token = _env("TFS_PAT_FOR_PR") or ""
+        register_secret(post_token)
+        if not dry_run and not post_token:
+            problems.add("TFS_PAT_FOR_PR is required to post (omit --post for a dry run)")
+    else:
+        gh["post_token"] = _env("GH_TOKEN_FOR_PR") or ""
+        register_secret(gh["post_token"])
+        if not dry_run and not gh["post_token"]:
+            problems.add("GH_TOKEN_FOR_PR is required to post (omit --post for a dry run)")
 
     # Feature 006. Parsed even when logging is off, so a bad value is reported
     # now rather than on the day someone first needs the feature. The directory
@@ -482,6 +643,19 @@ def load_config(
         _env("LLM_LOG"), "LLM_LOG", problems, False
     )
     llm_log_dir = os.path.abspath(_env("LLM_LOG_DIR") or ".llm-logs")
+
+    # Feature 007 (D8, D15).
+    prompt_tokens = _parse_int(
+        _env("LLM_MAX_PROMPT_TOKENS"), "LLM_MAX_PROMPT_TOKENS", problems, 120000, minimum=8000
+    )
+    output_tokens = _parse_int(
+        _env("LLM_MAX_OUTPUT_TOKENS"), "LLM_MAX_OUTPUT_TOKENS", problems, 8192, minimum=256
+    )
+    if output_tokens * 2 >= prompt_tokens:
+        problems.add(
+            f"LLM_MAX_OUTPUT_TOKENS ({output_tokens}) must be less than half of "
+            f"LLM_MAX_PROMPT_TOKENS ({prompt_tokens})"
+        )
 
     config = Config(
         tfs_base_url=base_url or "",
@@ -521,14 +695,34 @@ def load_config(
         review_max_diff_lines=_parse_int(
             _env("REVIEW_MAX_DIFF_LINES"), "REVIEW_MAX_DIFF_LINES", problems, 3000
         ),
+        # Feature 007: unset means no line cap - the token budget decides.
         llm_max_chunk_lines=_parse_int(
-            _env("LLM_MAX_CHUNK_LINES"), "LLM_MAX_CHUNK_LINES", problems, 1200
+            _env("LLM_MAX_CHUNK_LINES"), "LLM_MAX_CHUNK_LINES", problems, 0
         ),
         llm_log=llm_log,
         llm_log_dir=llm_log_dir,
         llm_log_keep=_parse_int(
             _env("LLM_LOG_KEEP"), "LLM_LOG_KEEP", problems, 10, minimum=1
         ),
+        platform=platform,
+        story_source=story_source,
+        gh_api_url=gh["api_url"],
+        gh_repository=gh["repository"],
+        gh_pr_number=gh["pr_number"],
+        gh_token=gh["token"],
+        gh_post_token=gh["post_token"],
+        gh_checklist_token=gh["checklist_token"],
+        gh_checklist_repo=gh["checklist_repo"],
+        gh_agent_repo=gh["agent_repo"],
+        llm_max_prompt_tokens=prompt_tokens,
+        llm_max_output_tokens=output_tokens,
+        llm_price_input_per_mtok=_parse_price(
+            _env("LLM_PRICE_INPUT_PER_MTOK"), "LLM_PRICE_INPUT_PER_MTOK", problems
+        ),
+        llm_price_output_per_mtok=_parse_price(
+            _env("LLM_PRICE_OUTPUT_PER_MTOK"), "LLM_PRICE_OUTPUT_PER_MTOK", problems
+        ),
+        llm_price_currency=_env("LLM_PRICE_CURRENCY") or "USD",
     )
 
     problems.raise_if_any()

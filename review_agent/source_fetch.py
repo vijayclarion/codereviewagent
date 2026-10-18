@@ -96,8 +96,40 @@ class ClonedSource:
         return f"ClonedSource(repo={self.repo!r}, ref={self.ref!r}, commit={self.commit!r})"
 
 
+#: Feature 007. GitHub's git endpoint needs a username in Basic auth; for a
+#: token it is this fixed, non-secret word (the form actions/checkout uses).
+GITHUB_USERNAME = "x-access-token"
+
+
+def _on_github(config):
+    return getattr(config, "platform", "tfs") == "github"
+
+
+def _repo_dir(repo):
+    """The clone's directory name. `owner/name` on GitHub -> `name`, so a clone
+    sits at the same depth as on TFS and `cleanup` removes the whole temp tree."""
+    return (repo or "").rstrip("/").split("/")[-1]
+
+
+def default_token(config, repo):
+    """The credential for cloning `repo` (feature 007, D6).
+
+    On GitHub the checklist repository may be private to a different owner, so
+    it has a token of its own; everything else uses the read token.
+    """
+    if not _on_github(config):
+        return getattr(config, "tfs_token", "")
+    checklist = (getattr(config, "checklist_repo", "") or "").lower()
+    if checklist and (repo or "").lower() == checklist:
+        return getattr(config, "gh_checklist_token", "") or getattr(config, "gh_token", "")
+    return getattr(config, "gh_token", "")
+
+
 def clone_url(config, repo):
     """Credential-free clone URL, with the non-secret username only."""
+    if _on_github(config):
+        scheme, _, rest = config.gh_web_url.rstrip("/").partition("://")
+        return f"{scheme}://{GITHUB_USERNAME}@{rest}/{repo}.git"
     base = config.tfs_base_url.rstrip("/")
     scheme, _, rest = base.partition("://")
     if not rest:  # not a URL we recognise; let git report it
@@ -107,6 +139,8 @@ def clone_url(config, repo):
 
 def public_url(config, repo):
     """The same URL with no credential component at all - what origin is left as."""
+    if _on_github(config):
+        return f"{config.gh_web_url.rstrip('/')}/{repo}.git"
     base = config.tfs_base_url.rstrip("/")
     return f"{base}/{config.tfs_project}/_git/{repo}"
 
@@ -130,9 +164,11 @@ def _write_askpass(directory):
     return path
 
 
-def basic_auth_header(token):
-    """The Authorization header value for a PAT. Registered as unprintable."""
-    encoded = base64.b64encode(f":{token}".encode("utf-8")).decode("ascii")
+def basic_auth_header(token, username=""):
+    """The Authorization header value for a PAT. Registered as unprintable.
+
+    TFS ignores the username; GitHub requires one (`x-access-token`)."""
+    encoded = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
     header = f"Authorization: Basic {encoded}"
     # The encoded form is as much a credential as the raw one, and an error
     # message that echoed it would leak just as completely.
@@ -141,7 +177,7 @@ def basic_auth_header(token):
     return header
 
 
-def _git_env(token, askpass_path):
+def _git_env(token, askpass_path, username=""):
     """Environment for the git child: the credential, and nothing else new."""
     values = {
         TOKEN_ENV: token or "",
@@ -156,7 +192,7 @@ def _git_env(token, askpass_path):
         count, key, value = HEADER_CONFIG_ENV
         values[count] = "1"
         values[key] = "http.extraHeader"
-        values[value] = basic_auth_header(token)
+        values[value] = basic_auth_header(token, username)
     return child_environment(
         values,
         # git gets the one credential it needs and no other. In particular the
@@ -188,7 +224,7 @@ def _run(args, env=None, cwd=None, runner=subprocess.run):
         ) from exc
 
 
-def clone(config, repo, ref=None, into=None, runner=subprocess.run):
+def clone(config, repo, ref=None, into=None, runner=subprocess.run, token=None):
     """Shallow-clone `repo` at `ref`, returning a ClonedSource.
 
     Never raises with the token in the message: git's stderr is passed through
@@ -201,9 +237,12 @@ def clone(config, repo, ref=None, into=None, runner=subprocess.run):
             remedy="set the repository name in configuration",
         )
     parent = into or tempfile.mkdtemp(prefix="review-agent-")
-    target = os.path.join(parent, repo)
+    target = os.path.join(parent, _repo_dir(repo))
     askpass = _write_askpass(parent)
-    env = _git_env(getattr(config, "tfs_token", ""), askpass)
+    credential = default_token(config, repo) if token is None else token
+    env = _git_env(
+        credential, askpass, username=GITHUB_USERNAME if _on_github(config) else ""
+    )
 
     # No ref means the repository's own default branch (feature 003, R2). The
     # previous default was the literal "master", which turned a repository whose
@@ -230,8 +269,13 @@ def clone(config, repo, ref=None, into=None, runner=subprocess.run):
         raise SetupFailure(
             f"could not obtain {repo} at {ref}: {detail[-1] if detail else 'git failed'}",
             remedy=(
-                "check the repository name, the branch, and that TFS_PAT grants "
-                "Code (read) on it"
+                "check the repository name, the branch, and that "
+                + (
+                    "the GitHub token (GH_TOKEN, or GH_CHECKLIST_TOKEN for the checklist "
+                    "repository) grants Contents (read) on it"
+                    if _on_github(config)
+                    else "TFS_PAT grants Code (read) on it"
+                )
             ),
         )
 

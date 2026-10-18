@@ -27,8 +27,10 @@ from .models import (
     ChecklistViolation,
     CodeIssue,
     CoverageEntry,
+    CrossFileIssue,
     FalseCoverageClaim,
     ReviewReport,
+    normalise_path,
 )
 
 CLAIM_MATCH_THRESHOLD = 0.5
@@ -166,6 +168,9 @@ def validate_payload(payload):
             )
         )
 
+    cross_file, demoted = _cross_file_issues(payload)
+    issues.extend(demoted)
+
     summary = _text(payload.get("summary"))
     if not summary:
         raise ContractViolation("summary is required and must be non-empty")
@@ -175,7 +180,61 @@ def validate_payload(payload):
         "checklist_violations": violations,
         "code_issues": issues,
         "summary": summary,
+        "cross_file_issues": cross_file,
+        "change_notes": _text(payload.get("change_notes"))[:CHANGE_NOTES_LIMIT],
     }
+
+
+#: Feature 007: a part's notes feed the synthesis prompt, not the reader.
+CHANGE_NOTES_LIMIT = 2000
+
+
+def _optional_list(payload, key):
+    """An optional array: absent or null is empty; anything else must be a list."""
+    value = payload.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ContractViolation(f"{key} must be an array")
+    return value
+
+
+def _cross_file_issues(payload):
+    """(cross-file issues, issues demoted to code issues) - contracts/llm-response.md.
+
+    An entry naming fewer than two distinct files is not cross-file. It is
+    demoted to a code issue rather than dropped: what it says may still be true.
+    """
+    found, demoted = [], []
+    for row in _optional_list(payload, "cross_file_issues"):
+        if not isinstance(row, dict):
+            raise ContractViolation("cross_file_issues entries must be objects")
+        severity = _text(row.get("severity")).lower()
+        if severity not in SEVERITIES:
+            raise ContractViolation(
+                f"invalid severity {severity!r}; expected one of {', '.join(SEVERITIES)}"
+            )
+        issue = _text(row.get("issue"))
+        if not issue:
+            raise ContractViolation("cross-file issue has an empty issue")
+        files = row.get("files") or []
+        if not isinstance(files, list):
+            raise ContractViolation("cross-file issue 'files' must be an array")
+        files = tuple(dict.fromkeys(_text(f) for f in files if _text(f)))
+        anchor, line = _text(row.get("file")), _line(row.get("line"))
+        distinct = {normalise_path(f) for f in files}
+        if len(distinct) < 2:
+            demoted.append(
+                CodeIssue(severity=severity, issue=issue, file=anchor or (files[0] if files else ""), line=line)
+            )
+            continue
+        found.append(CrossFileIssue(severity=severity, issue=issue, files=files, file=anchor, line=line))
+    return found, demoted
+
+
+def cross_file_key(issue):
+    """The identity of a cross-file issue: the files it involves (finding-identity.md)."""
+    return "|".join(sorted({normalise_path(f) for f in issue.files}))
 
 
 def parse_response(text):
@@ -385,9 +444,16 @@ def merge_results(results):
     """Union findings across chunks, collapsing duplicates by fingerprint."""
     coverage, violations, issues, summaries = [], [], [], []
     seen_coverage, seen_violations, seen_issues = set(), set(), set()
+    cross_file, seen_cross, notes = [], set(), []
 
     for result in results:
         summaries.append(result["summary"])
+        notes.append(result.get("change_notes", ""))
+        for issue in result.get("cross_file_issues", ()):
+            key = cross_file_key(issue)
+            if key not in seen_cross:  # first wins (contracts/llm-response.md rule 1)
+                seen_cross.add(key)
+                cross_file.append(issue)
 
         for entry in result["coverage"]:
             key = normalise(entry.criterion)
@@ -422,7 +488,72 @@ def merge_results(results):
         "checklist_violations": violations,
         "code_issues": issues,
         "summary": summary,
+        "cross_file_issues": cross_file,
+        "change_notes": notes,
     }
+
+
+# --------------------------------------------------------------------------
+# Synthesis (feature 007, D12, contracts/llm-response.md)
+# --------------------------------------------------------------------------
+
+
+def validate_synthesis(payload):
+    """The synthesis contract: a summary, optionally verdicts and cross-file issues.
+
+    Any other key - code issues, checklist violations - is ignored: the
+    synthesis saw findings, not code, so it may not add either.
+    """
+    if not isinstance(payload, dict):
+        raise ContractViolation("the synthesis response must be a JSON object")
+    summary = _text(payload.get("summary"))
+    if not summary:
+        raise ContractViolation("summary is required and must be non-empty")
+    coverage = []
+    if payload.get("coverage") is not None:
+        coverage = validate_payload(
+            {"coverage": payload.get("coverage"), "checklist_violations": [],
+             "code_issues": [], "summary": summary}
+        )["coverage"]
+    cross_file, _demoted = _cross_file_issues(payload)
+    return {"summary": summary, "coverage": coverage, "cross_file_issues": cross_file}
+
+
+def parse_synthesis(text):
+    return validate_synthesis(extract_json(text))
+
+
+def apply_synthesis(merged, synthesis):
+    """The merged chunk results, with the synthesis applied (merge rules 2-4)."""
+    final = dict(merged)
+    verdicts = {normalise(c.criterion): c for c in synthesis.get("coverage", ())}
+    final["coverage"] = [verdicts.pop(normalise(c.criterion), c) for c in merged["coverage"]]
+    final["coverage"].extend(verdicts.values())  # criteria only the synthesis judged
+    final["summary"] = synthesis["summary"]
+
+    combined = {cross_file_key(i): i for i in merged.get("cross_file_issues", ())}
+    for issue in synthesis.get("cross_file_issues", ()):
+        combined[cross_file_key(issue)] = issue  # synthesis saw everything; it wins
+    final["cross_file_issues"] = list(combined.values())
+    return final
+
+
+def parse_synthesis_with_retry(prompt, call, retry_instruction):
+    """`parse_with_retry` for the synthesis contract: one stricter retry, then degrade."""
+    first_error = None
+    for attempt in (1, 2):
+        text = call(prompt if attempt == 1 else f"{prompt}\n\n{retry_instruction}")
+        try:
+            return parse_synthesis(text), attempt - 1
+        except ContractViolation as exc:
+            if attempt == 1:
+                first_error = exc
+                continue
+            raise DegradedReview(
+                f"the synthesis response did not match the required shape after a retry "
+                f"(first: {first_error}; second: {exc})"
+            )
+    raise DegradedReview("the synthesis response could not be parsed")
 
 
 _COVERAGE_RANK = {"not_addressed": 0, "appears_addressed": 1, "possible_contradiction": 2}
@@ -544,6 +675,7 @@ def build_report(merged, declared_scope, work_items, reviewable=None, notes=(), 
         documents=tuple(getattr(corpus, "documents", ()) or ()),
         dropped_citations=dropped,
         dropped_for_budget=tuple(getattr(corpus, "dropped_for_budget", ()) or ()),
+        cross_file_issues=tuple(merged.get("cross_file_issues", ())),
     )
 
 

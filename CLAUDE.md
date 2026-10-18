@@ -1,43 +1,45 @@
 <!-- SPECKIT START -->
 # CodeReviewAgent
 
-**Active feature**: `006-llm-prompt-response-log` — LLM Prompt and Response Log. An
-opt-in setting writes every prompt sent to the provider and every response received to a
-plain text file: one file per run, each entry flushed as it happens, everything redacted on
-the way out, old logs pruned to a configured count.
-**This feature writes agent code** — the first since 003. `review_agent/` and `tests/` are
-in scope, and the suite is the contract: **532 passing at `e93d157`, measured**.
+**Active feature**: `007-github-and-cross-file`. It covers GitHub (and GitHub Enterprise
+Server) as a second hosting platform, GitHub Issues as a story source, cross-file review
+(token budget, PR outline, dependency-aware chunking, one synthesis pass), real token counts
+and cost in the LLM log, a reusable GitHub workflow, documentation, and a live demo across
+three repositories. `review_agent/`, `tests/`, `docs/`, `.github/` and two other
+repositories are in scope. The suite is the contract: **597 passing at `7eddb98`,
+measured**.
 
-- Plan: `specs/006-llm-prompt-response-log/plan.md` — **start here**; the Call Site Ledger
-  and the Safety Register are the spine
-- Spec: `specs/006-llm-prompt-response-log/spec.md` — 31 requirements, five recorded
-  clarifications
-- Research: `specs/006-llm-prompt-response-log/research.md` — decisions D1-D12,
-  evidence E1-E20
-- Data model: `specs/006-llm-prompt-response-log/data-model.md`
-- Contracts: `specs/006-llm-prompt-response-log/contracts/` — log format, configuration,
-  **retention**, module boundary
-- Implementer quickstart: `specs/006-llm-prompt-response-log/quickstart.md`
-- **The deliverable**: `review_agent/llm_log.py` plus edits to `config.py`, `main.py`,
-  `bootstrap.py` — not written yet
+- Plan: `specs/007-github-and-cross-file/plan.md`. **Start here**: the Call Site Ledger, the
+  Safety Register, the secrets list and Open Question Q1
+- Spec: `specs/007-github-and-cross-file/spec.md`: 7 stories, 42 requirements, Survey
+  Findings S1-S8
+- Research: `specs/007-github-and-cross-file/research.md`: decisions D1-D20, evidence E1-E24
+- Data model: `specs/007-github-and-cross-file/data-model.md`
+- Contracts: `specs/007-github-and-cross-file/contracts/`: platform client, configuration,
+  LLM response, log format, finding identity, workflow
+- Implementer quickstart: `specs/007-github-and-cross-file/quickstart.md`: order of work
+  and five traps
 
-**The whole feature is one new module and a wrapper around one existing lambda**
-(`main.py:296`). `llm_adapter.py`, `prompt_builder.py` and `parser.py` are **not touched** —
-research D1 explains why logging inside `call_llm` is the obvious choice and the wrong one:
-it would couple the wire-format module to the filesystem and emit three identical entries
-whenever the provider timed out. Three traps the survey found, each an afternoon:
-the wrapper must resolve `call_llm` **at call time** (seven tests monkeypatch
-`main_module.call_llm`); a relative log path must be resolved in the **launching** process,
-because the child reviews from a temp clone that is then deleted (`bootstrap.py:76`); and
-the boundary test greps source text for `"git"` and `subprocess.`, so a docstring can fail
-the suite with a message about git.
+Facts the survey found that a reader would otherwise guess wrongly:
 
-**Pruning is the only destructive operation this repository has ever had that touches a
-directory the operator chose.** `source_fetch.cleanup` removes a temp tree it made itself;
-`LLM_LOG_KEEP` deletes inside a configured path. Two guards, both in
-`contracts/retention.md`: a filename pattern that proves authorship, and a timestamp
-comparison that never deletes a file newer than the running process. Read that contract
-before writing the sweep.
+- `TfsClient(purpose="post")` is **never built**: TFS posts with the reading token, and
+  `TFS_PAT_FOR_PR` is required but unused (E3, Q1).
+- `call_llm` discards the provider's usage figures, and its transport retries never reach
+  the log (E6, E7).
+- `tests/demo/run.py` fakes `call_llm` with no `**kwargs`, so usage rides on a `str`
+  subclass rather than on a new parameter (D14).
+- **The `.env` repository URL variables are swapped**: `GIT_REPO_CODE_SAMPLE` points at the
+  agent repository and `GIT_REPO_CODE_REVIEW_CodeReviewAgent` at the sample (E22). This
+  working copy is GitHub `vijayclarion/codereviewagent` master, but it has no remote
+  configured (E23).
+- `tfs_client.py`, `dedupe.py` and `tests/fakes.py` are not touched. TFS sits behind an
+  adapter (D1).
+
+**Prior feature**: `006-llm-prompt-response-log`, LLM Prompt and Response Log.
+**Implemented** (`review_agent/llm_log.py`). Plan, research (D1-D12) and contracts
+(log format, configuration, **retention**, module boundary) are in
+`specs/006-llm-prompt-response-log/`. Pruning is still the only operation that deletes
+inside a directory the operator chose. Read `contracts/retention.md` before touching it.
 
 **Prior feature** — `005-agent-flow-developer-guide`, Local-Mode Call Flow Diagram and
 Developer Onboarding Guide:
@@ -90,6 +92,13 @@ carries correctly is the expensive mistake available here.
   2026-09-15** against a real pull request. Still valid; 003 does not replace it.
 - Example files: `specs/002-pr-review-walkthrough/example-files/` — deliberately faulty
   sample code. Never imported, never collected by `pytest`, never to be "fixed".
+
+## Running the agent against GitHub
+
+`PLATFORM=github GH_REPOSITORY=owner/name --pr N`. `.env`'s `GIT_REPO_TOKEN` is accepted as
+the read token. **The `.env` URL variables `GIT_REPO_CODE_SAMPLE` and
+`GIT_REPO_CODE_REVIEW_CodeReviewAgent` are swapped** (007 E22): the first points at the
+agent repository, the second at the sample. The agent reads neither.
 
 ## Running the agent against this server
 
@@ -151,13 +160,13 @@ Found by survey during 002's planning. Trust the code over the document:
 ## Read before changing code
 
 **This is not a greenfield project.** `review_agent/` is ~9,000 committed lines
-with 532 passing tests, built by an earlier spec-kit cycle whose spec artifacts
+with 597 passing tests, built by an earlier spec-kit cycle whose spec artifacts
 were lost. Survey before you build — most of what a task asks for already exists.
 
 **Verify the suite still passes after every change:**
 
 ```bash
-python -m pytest tests             # 532 passing, no live network
+python -m pytest tests             # 597 passing at 7eddb98, no live network
 ```
 
 **Not `-q`.** `pytest.ini` already sets it, so `-q` again runs at `-qq` and prints no
@@ -181,6 +190,11 @@ Enforced by `tests/contract/`. Breaking one breaks a test — by design.
 | `source_fetch.py` and `llm_log.py` are the only modules that delete a path | `test_import_boundaries.py` |
 | No credential reaches a prompt/response log file | `test_llm_log_is_redacted.py` |
 | Log retention deletes only the agent's own log files | `test_llm_log_prunes_only_its_own.py` |
+| `github_client.py` is the only module that speaks the GitHub API | `test_github_boundary.py`, `test_import_boundaries.py` |
+| A GitHub preview builds no client holding the posting token | `test_preview_makes_no_writes_github.py` |
+| No GitHub token reaches console, log, posted comment or error text | `test_github_secrets_never_leak.py` |
+| Every send to the provider is a log entry; totals equal the sum | `test_every_send_is_logged.py` |
+| Workflow: no `pull_request_target`, least privilege, draft/fork skip, concurrency | `test_workflow_contract.py` |
 | `not_addressed` never produces a comment | `tests/unit/test_routing_not_addressed.py` — the one row not under `tests/contract/` |
 
 Output goes through `config.emit`, which redacts and handles cp1252 consoles.
@@ -188,6 +202,17 @@ A new output destination must route through `redact` too — a file writer that
 calls `json.dump` directly bypasses the only thing stopping a token escaping.
 
 ## Known state
+
+- **GitHub is supported** (feature 007): `PLATFORM=github`, GitHub Issues as stories,
+  one review per run, the reusable workflow `.github/workflows/code-review.yml`. Setup:
+  `docs/github-setup.md`. TFS is unchanged apart from what 007 applies to both platforms:
+  the token budget (`LLM_MAX_PROMPT_TOKENS`; `LLM_MAX_CHUNK_LINES` is now an optional cap),
+  the `### Cross-file issues` summary section, the `llm usage:` line and 8192 output tokens.
+- **Cross-file review**: every chunk carries a PR outline; a multi-chunk review makes one
+  synthesis call. Under the default budget almost every PR is one call (measured,
+  `specs/007.../validation.md`).
+- **TFS posts with the reading token** (`TFS_PAT`); `TFS_PAT_FOR_PR` is required and unused
+  (007 research E3). Fixing it is task T094, gated on the requester's answer to Q1.
 
 - **`checklist_docs.py` is wired in** — gap G1 is closed. `checklist.py` obtains a
   working copy of the checklist repository through `source_fetch.clone`, reads every

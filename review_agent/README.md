@@ -1,9 +1,14 @@
 # AI Code Review Agent
 
-Reviews a TFS / Azure DevOps **Server** pull request against (a) its linked user story
-and (b) the team's shared code-review checklists — spreadsheets and Word documents, read
-from a working copy of the checklist repository — then posts structured feedback back onto
-the pull request.
+Reviews a pull request on **TFS / Azure DevOps Server** or **GitHub** (github.com and
+GitHub Enterprise Server) against (a) its linked user story — a TFS work item or a GitHub
+issue — and (b) the team's shared code-review checklists — spreadsheets and Word documents,
+read from a working copy of the checklist repository — then posts structured feedback back
+onto the pull request. Defects that span files (a signature changed and a caller not
+updated) are reported as cross-file issues.
+
+> **On GitHub?** `docs/github-setup.md` covers the tokens, the two secrets, the ~19-line
+> caller workflow that onboards a repository, and local runs.
 
 **A reviewer aid, not a merge gate.** It reasons over diff text and cannot verify runtime
 behaviour, so a human always decides the merge. Defaults are preview mode and
@@ -26,6 +31,8 @@ detail:
 | `possible_contradiction` | yes, if identified and located | yes |
 | `code_issue` severity `high` | yes, if located | yes |
 | `code_issue` medium / low | yes, if located | no |
+| Cross-file issue `high` | yes, if located; always listed in the summary | yes |
+| Cross-file issue medium / low | yes, if located; always listed in the summary | no |
 | Checklist violation | yes, if identified and located | no |
 | `appears_addressed` | no | no |
 | `not_addressed` | **never** | **never** |
@@ -61,7 +68,7 @@ python -m review_agent [--dry-run | --post] [--pr ID] [--local] [--quiet] [--log
 |---|---|
 | `--dry-run` | Print the feedback, post nothing. Overrides `DRY_RUN`. |
 | `--post` | Post to the pull request. Overrides `DRY_RUN`. |
-| `--pr ID` | Override `TFS_PR_ID` for one run. |
+| `--pr ID` | Override `TFS_PR_ID` (or `GH_PR_NUMBER` on GitHub) for one run. |
 | `--local` | Review with this working copy instead of the fetched agent source. |
 | `--quiet` | Suppress the phase log. |
 | `--log-llm` | Write every prompt and response to a log file for this run. Overrides `LLM_LOG`. |
@@ -84,7 +91,27 @@ clone and you do not normally type it.
 Precedence: **pipeline variable → `.env` → default.** A validation build therefore needs
 no `.env` on the agent.
 
-### Always required
+### Platform (feature 007)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PLATFORM` | `tfs` | `tfs` or `github`. Only the chosen platform's settings are required |
+| `STORY_SOURCE` | the platform's own | `tfs` (work items), `github-issues` (issues the PR closes), or `none` (checklist-only, said so) |
+
+### GitHub (`PLATFORM=github`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GH_REPOSITORY` (alias `GITHUB_REPOSITORY`) | — | **Required.** `owner/name` |
+| `GH_PR_NUMBER` | — | **Required** (or `--pr`) |
+| `GH_TOKEN` (aliases `GITHUB_TOKEN`, `GIT_REPO_TOKEN`) | — | **Required.** Read token: Pull requests, Issues, Contents (read) |
+| `GH_TOKEN_FOR_PR` | — | **Required to post.** Pull requests and Issues (write). A preview never builds a client holding it |
+| `GH_API_URL` (alias `GITHUB_API_URL`) | `https://api.github.com` | GitHub Enterprise Server: `https://<host>/api/v3` |
+| `GH_CHECKLIST_REPO` | the checklist settings below | `owner/name` of the checklist repository |
+| `GH_CHECKLIST_TOKEN` | `GH_TOKEN` | Contents (read) on the checklist repository |
+| `GH_AGENT_REPO` | — | `owner/name` of the agent, for the default (fetching) entry point. Not needed with `--local` |
+
+### Always required on TFS
 
 | Variable | Pipeline equivalent |
 |---|---|
@@ -130,7 +157,11 @@ instead of a clear message.
 | `REVIEW_EXCLUDE_MODE` | `extend` | `extend` or `replace` the built-in list |
 | `REVIEW_MAX_FILES` | `40` | Review bound |
 | `REVIEW_MAX_DIFF_LINES` | `3000` | Review bound |
-| `LLM_MAX_CHUNK_LINES` | `1200` | Split into another pass above this |
+| `LLM_MAX_PROMPT_TOKENS` | `120000` | Budget for one call, whole prompt, estimated at 3 characters per token. A PR under it is one call; above it, it is split with an outline in every part and one extra synthesis call |
+| `LLM_MAX_OUTPUT_TOKENS` | `8192` | The model's output limit (sent to Claude). Must be under half the prompt budget |
+| `LLM_MAX_CHUNK_LINES` | unset | **Changed by 007**: was a 1200-line default; now an optional extra cap on changed lines per call |
+| `LLM_PRICE_INPUT_PER_MTOK` / `LLM_PRICE_OUTPUT_PER_MTOK` | unset | Price per million tokens. With both set, every run prints its estimated cost |
+| `LLM_PRICE_CURRENCY` | `USD` | Label for that cost |
 | `LLM_LOG` | `false` | Write every prompt and response to a file. **Off by default** — see Security |
 | `LLM_LOG_DIR` | `.llm-logs` | Where those files go. A relative path resolves against the directory you ran from, not the fetched clone |
 | `LLM_LOG_KEEP` | `10` | How many of the agent's own logs survive. Older ones are deleted at the start of each run |

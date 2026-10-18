@@ -11,7 +11,7 @@ what lets an inline comment land on the right line instead of a guess.
 
 import difflib
 
-from .models import ChangedFile, ChangeSet, SkippedFile
+from .models import ChangedFile, ChangeEntry, ChangeSet, SkippedFile
 
 CONTEXT_LINES = 3
 
@@ -116,18 +116,28 @@ def build_file_diff(path, before, after):
     return "".join(diff_lines), line_map, changed
 
 
+def _entry_fields(entry):
+    """(path, change type, is a folder) from either entry shape.
+
+    TFS hands over raw change-entry dicts; GitHub's client hands over
+    `ChangeEntry` objects (feature 007). Both reach the same code below.
+    """
+    if isinstance(entry, ChangeEntry):
+        return entry.path, entry.change_type, False
+    item = entry.get("item") or {}
+    folder = bool(item.get("isFolder")) or item.get("gitObjectType") == "tree"
+    return item.get("path") or "", _normalise_change_type(entry.get("changeType")), folder
+
+
 def build_change_set(client, pull_request_context, change_entries):
     """Fetch blobs and assemble the ChangeSet. Returns (ChangeSet, skipped)."""
     files = []
     skipped = []
 
     for entry in change_entries or []:
-        item = entry.get("item") or {}
-        path = item.get("path") or ""
-        if not path or item.get("isFolder") or item.get("gitObjectType") == "tree":
+        path, change_type, is_folder = _entry_fields(entry)
+        if not path or is_folder:
             continue
-
-        change_type = _normalise_change_type(entry.get("changeType"))
 
         if change_type == "delete":
             # Nothing in the post-change file to comment on.
@@ -164,6 +174,7 @@ def build_change_set(client, pull_request_context, change_entries):
                 diff=diff,
                 line_map=line_map,
                 changed_lines=changed,
+                content=after,
             )
         )
 

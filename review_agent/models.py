@@ -67,6 +67,80 @@ class WorkItem:
             criteria=criteria,
         )
 
+    @classmethod
+    def from_issue(cls, payload, ordinal_start=1):
+        """Build from a GitHub issue (feature 007, research D7).
+
+        Criteria come from the "Acceptance criteria" section; with no such
+        section they fall back to the description, exactly as a TFS work item
+        without its criteria field does.
+        """
+        data = payload or {}
+        number = int(data.get("number") or 0)
+        description, section = split_issue_body(data.get("body") or "")
+        source = _flatten_criteria(section) if section else description
+        criteria = tuple(
+            AcceptanceCriterion(ordinal=ordinal_start + i, text=text, work_item_id=number)
+            for i, text in enumerate(split_criteria(source))
+        )
+        labels = tuple(
+            (label.get("name") if isinstance(label, dict) else str(label)) or ""
+            for label in (data.get("labels") or ())
+        )
+        return cls(
+            id=number,
+            title=data.get("title", "") or "",
+            description=description,
+            acceptance_criteria=section,
+            work_item_type="GitHub issue",
+            state=data.get("state", "") or "",
+            tags=tuple(label for label in labels if label),
+            criteria=criteria,
+        )
+
+
+_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+_CRITERIA_HEADING = re.compile(r"^acceptance\s+criteria\b", re.IGNORECASE)
+_CHECKBOX = re.compile(r"^(\s*(?:[-*•]|\d+[.)])\s+)\[[ xX]\]\s*")
+_NESTED_BULLET = re.compile(r"^\s{2,}(?:[-*•]|\d+[.)])\s+(?:\[[ xX]\]\s*)?(.*)$")
+
+
+def split_issue_body(body):
+    """(description, acceptance-criteria section) of a GitHub issue body.
+
+    The section is the one under a heading reading "Acceptance criteria" at any
+    level and in any case, up to the next heading of any level. Absent ->
+    (whole body, "").
+    """
+    lines = (body or "").replace("\r\n", "\n").split("\n")
+    start = None
+    for index, line in enumerate(lines):
+        match = _HEADING.match(line)
+        if match and _CRITERIA_HEADING.match(match.group(2)):
+            start = index
+            break
+    if start is None:
+        return (body or "").strip(), ""
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if _HEADING.match(lines[index]):
+            end = index
+            break
+    description = "\n".join(lines[:start] + lines[end:]).strip()
+    return description, "\n".join(lines[start + 1:end]).strip()
+
+
+def _flatten_criteria(section):
+    """Checkbox markers stripped; a nested bullet folded into its parent."""
+    out = []
+    for line in section.split("\n"):
+        nested = _NESTED_BULLET.match(line)
+        if nested and out:
+            out[-1] = f"{out[-1]} {nested.group(1).strip()}"
+            continue
+        out.append(_CHECKBOX.sub(lambda m: m.group(1), line))
+    return "\n".join(out)
+
 
 # --------------------------------------------------------------------------
 # Pull request
@@ -83,10 +157,36 @@ class PullRequestContext:
     iteration_id: int = 0
     iteration_commit: str = ""
     base_commit: str = ""
+    # Feature 007: which platform the pull request lives on. GitHub has no
+    # iterations, so the summary names the head commit instead.
+    platform: str = "tfs"
+    is_draft: bool = False
+    is_fork: bool = False
 
     @property
     def run_id(self):
         return f"{self.pr_id}.{self.iteration_id}"
+
+    @classmethod
+    def from_github(cls, number, payload):
+        """Build from a GitHub pull-request payload (feature 007)."""
+        data = payload or {}
+        head = data.get("head") or {}
+        base = data.get("base") or {}
+        head_repo = (head.get("repo") or {}).get("full_name") or ""
+        base_repo = (base.get("repo") or {}).get("full_name") or ""
+        return cls(
+            pr_id=int(number),
+            title=data.get("title", "") or "",
+            description=data.get("body", "") or "",
+            source_branch=head.get("ref", "") or "",
+            target_branch=base.get("ref", "") or "",
+            platform="github",
+            is_draft=bool(data.get("draft")),
+            # A deleted fork reports no head repository at all; that is still
+            # not this repository, so it counts as a fork.
+            is_fork=bool(base_repo) and head_repo != base_repo,
+        )
 
     @classmethod
     def from_payload(cls, pr_id, payload):
@@ -184,6 +284,10 @@ class ChangedFile:
     line_map: dict = field(default_factory=dict, compare=False)
     changed_lines: int = 0
     relevance: float = 0.0
+    # Feature 007: the post-change text, kept for the file skeleton an
+    # oversized file's pieces are shown with. Excluded from equality and repr:
+    # it can be the largest thing in the run.
+    content: str = field(default="", compare=False, repr=False)
 
     @property
     def is_source(self):
@@ -201,6 +305,39 @@ class SkippedFile:
 @dataclass(frozen=True)
 class ChangeSet:
     files: tuple = ()
+
+
+#: Feature 007. The change types the pipeline understands, on either platform.
+CHANGE_TYPES = ("add", "edit", "delete", "rename")
+
+
+@dataclass(frozen=True)
+class ChangeEntry:
+    """One changed path, platform-neutral (feature 007, data-model "Platform")."""
+
+    path: str
+    change_type: str = "edit"
+    previous_path: str = ""
+
+    def __post_init__(self):
+        if not self.path:
+            raise ValueError("a change entry needs a path")
+        if self.change_type not in CHANGE_TYPES:
+            raise ValueError(f"unknown change type: {self.change_type!r}")
+
+
+@dataclass(frozen=True)
+class Revision:
+    """What is being reviewed against what (feature 007).
+
+    `base` is TFS's common-ref commit, or on GitHub the merge base from the
+    compare API - never the target branch's current tip, which would review
+    the target's own later changes as if the author had made them.
+    """
+
+    iteration_id: int = 0
+    head: str = ""
+    base: str = ""
 
 
 @dataclass(frozen=True)
@@ -580,6 +717,29 @@ class CodeIssue:
     line: int = 0
 
 
+def normalise_path(path):
+    return (path or "").lstrip("/").replace("\\", "/").lower()
+
+
+@dataclass(frozen=True)
+class CrossFileIssue:
+    """A finding no single file shows (feature 007, D13). Names every file involved."""
+
+    severity: str
+    issue: str
+    files: tuple = ()
+    file: str = ""
+    line: int = 0
+
+    def __post_init__(self):
+        if self.severity not in SEVERITIES:
+            raise ValueError(f"invalid severity {self.severity!r}")
+        if not (self.issue or "").strip():
+            raise ValueError("a cross-file issue must say what is wrong")
+        if len({normalise_path(f) for f in self.files if f}) < 2:
+            raise ValueError("a cross-file issue names at least two distinct files")
+
+
 @dataclass(frozen=True)
 class FalseCoverageClaim:
     criterion: str
@@ -612,6 +772,10 @@ class ReviewReport:
     dropped_for_budget: tuple = ()
     # Feature 003: the whole of the above, in one object the summary renders.
     inventory: object = None
+    # Feature 007.
+    cross_file_issues: tuple = ()
+    synthesis: str = "not needed"  # "not needed" | "complete" | "failed: <reason>"
+    usage: object = None
 
     @property
     def has_blocking_findings(self):
@@ -624,6 +788,8 @@ class ReviewReport:
         if self.false_coverage_claims:
             return True
         if any(c.status == "possible_contradiction" for c in self.coverage):
+            return True
+        if any(i.severity == "high" for i in self.cross_file_issues):
             return True
         return any(i.severity == "high" for i in self.code_issues)
 

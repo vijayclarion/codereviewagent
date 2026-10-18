@@ -33,6 +33,13 @@ def _isolate_env(monkeypatch):
             ("TFS_", "LLM_", "CHECKLIST_", "REVIEW_", "SYSTEM_", "DRY_RUN", "FAIL_ON_")
         ):
             monkeypatch.delenv(key, raising=False)
+        # Feature 007: a GitHub Actions runner exports GITHUB_TOKEN and friends,
+        # and the requester's .env carries GIT_REPO_TOKEN. Neither may reach a test.
+        if key.startswith(("GH_", "GITHUB_", "GIT_REPO_")) or key in (
+            "PLATFORM",
+            "STORY_SOURCE",
+        ):
+            monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("REVIEW_AGENT_SKIP_DOTENV", "1")
 
 
@@ -141,3 +148,23 @@ def load_fixture(*parts):
 
 def read_fixture_text(*parts):
     return FIXTURES.joinpath(*parts).read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def github_env(monkeypatch):
+    """The minimum valid configuration for a GitHub run (feature 007)."""
+    values = {
+        "PLATFORM": "github",
+        "GH_REPOSITORY": "acme/shop",
+        "GH_PR_NUMBER": "12",
+        "GH_TOKEN": "gh-read-secret-value",
+        "GH_TOKEN_FOR_PR": "gh-post-secret-value",
+        "GH_CHECKLIST_REPO": "acme/checklists",
+        "GH_AGENT_REPO": "acme/agent",
+        "LLM_PROVIDER": "claude",
+        "LLM_MODEL": "claude-sonnet-5",
+        "LLM_API_KEY": "llm-secret-value",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return values

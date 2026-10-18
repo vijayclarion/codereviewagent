@@ -11,6 +11,7 @@ reliably and an SDK's transitive tree may not (research R1).
 """
 
 import time
+from dataclasses import dataclass
 
 import requests
 
@@ -22,7 +23,9 @@ RETRY_BACKOFF = (1, 2, 4)
 RETRY_STATUSES = (429, 500, 502, 503, 504)
 
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MAX_TOKENS = 4096
+#: Feature 007: was 4096. A whole-PR call returns more findings than a chunk did,
+#: and a truncated JSON response degrades the entire run (research D8).
+DEFAULT_MAX_TOKENS = 8192
 
 _DEFAULT_BASE_URLS = {
     "claude": "https://api.anthropic.com",
@@ -57,7 +60,7 @@ def _request_for(config, prompt):
             },
             {
                 "model": config.llm_model,
-                "max_tokens": DEFAULT_MAX_TOKENS,
+                "max_tokens": int(getattr(config, "llm_max_output_tokens", DEFAULT_MAX_TOKENS)),
                 "messages": [{"role": "user", "content": prompt}],
             },
             _extract_anthropic,
@@ -117,8 +120,79 @@ def _extract_ollama(payload):
     return (payload or {}).get("response", "") or ""
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    """What the provider says a call consumed. Never estimated (FR-022)."""
+
+    input: object = None
+    output: object = None
+
+    @property
+    def reported(self):
+        return self.input is not None or self.output is not None
+
+
+@dataclass(frozen=True)
+class SendRecord:
+    """One HTTP attempt inside `call_llm` (feature 007, D14)."""
+
+    number: int
+    outcome: str  # "ok" | "retried" | "failed"
+    detail: str = ""
+    elapsed_ms: int = 0
+    usage: object = None
+    text: str = ""
+
+    def __post_init__(self):
+        if self.outcome not in ("ok", "retried", "failed"):
+            raise ValueError(f"unknown send outcome: {self.outcome!r}")
+        if self.outcome != "ok" and not self.detail:
+            raise ValueError("a send that did not succeed must say why")
+
+
+class LlmText(str):
+    """The model's text - a `str`, so every caller and every test fake keeps
+    working - carrying what the provider reported and every send it took.
+
+    Feature 007 (D14): usage rides on the return value rather than on a new
+    parameter or return type, because 22 tests replace `call_llm` with fakes
+    that return plain strings, one of them with no `**kwargs` at all.
+    """
+
+    def __new__(cls, text, usage=None, sends=()):
+        value = super().__new__(cls, text)
+        value.usage = usage
+        value.sends = tuple(sends)
+        return value
+
+
+def _number(value):
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _usage(provider, payload):
+    """The provider's own token counts. Only this module knows where they live."""
+    data = payload or {}
+    if provider == "claude":
+        usage = data.get("usage") or {}
+        found = TokenUsage(_number(usage.get("input_tokens")), _number(usage.get("output_tokens")))
+    elif provider in ("openai", "azure"):
+        usage = data.get("usage") or {}
+        found = TokenUsage(_number(usage.get("prompt_tokens")), _number(usage.get("completion_tokens")))
+    elif provider == "ollama":
+        found = TokenUsage(_number(data.get("prompt_eval_count")), _number(data.get("eval_count")))
+    else:
+        found = TokenUsage()
+    return found if found.reported else None
+
+
+def _with_sends(exc, sends):
+    exc.sends = tuple(sends)
+    return exc
+
+
 def call_llm(prompt, config, session=None, sleep=time.sleep):
-    """Send one prompt, return the model's raw text.
+    """Send one prompt, return the model's raw text (an `LlmText`).
 
     A provider that cannot be reached is a degraded review, not a setup failure:
     an outage must not gate a merge (FR-029).
@@ -126,51 +200,80 @@ def call_llm(prompt, config, session=None, sleep=time.sleep):
     url, headers, body, extract = _request_for(config, prompt)
     http = session or requests
     last_detail = None
+    sends = []
+
+    def _record(number, outcome, detail, started, usage=None, text=""):
+        sends.append(
+            SendRecord(number, outcome, detail, int((time.monotonic() - started) * 1000), usage, text)
+        )
 
     for attempt in range(RETRY_ATTEMPTS):
+        number = attempt + 1
+        started = time.monotonic()
         try:
             response = http.post(url, headers=headers, json=body, timeout=TIMEOUT)
         except requests.RequestException as exc:
             last_detail = type(exc).__name__
             if attempt < RETRY_ATTEMPTS - 1:
+                _record(number, "retried", last_detail, started)
                 sleep(RETRY_BACKOFF[attempt])
                 continue
-            raise DegradedReview(
-                f"the AI provider was unreachable after {RETRY_ATTEMPTS} attempts "
-                f"({last_detail})"
+            _record(number, "failed", last_detail, started)
+            raise _with_sends(
+                DegradedReview(
+                    f"the AI provider was unreachable after {RETRY_ATTEMPTS} attempts "
+                    f"({last_detail})"
+                ),
+                sends,
             )
 
-        if response.status_code in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1:
+        status = response.status_code
+        if status in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1:
+            _record(number, "retried", f"HTTP {status}", started)
             sleep(_retry_after(response, attempt))
             continue
 
-        if response.status_code in (401, 403):
-            raise SetupFailure(
-                f"the AI provider rejected the credential (HTTP {response.status_code})",
-                remedy="check LLM_API_KEY",
+        if status in (401, 403):
+            _record(number, "failed", f"HTTP {status}", started)
+            raise _with_sends(
+                SetupFailure(
+                    f"the AI provider rejected the credential (HTTP {status})",
+                    remedy="check LLM_API_KEY",
+                ),
+                sends,
             )
-        if response.status_code == 404:
-            raise SetupFailure(
-                "the AI provider has no such model or endpoint (HTTP 404)",
-                remedy="check LLM_MODEL and LLM_BASE_URL",
+        if status == 404:
+            _record(number, "failed", "HTTP 404", started)
+            raise _with_sends(
+                SetupFailure(
+                    "the AI provider has no such model or endpoint (HTTP 404)",
+                    remedy="check LLM_MODEL and LLM_BASE_URL",
+                ),
+                sends,
             )
-        if response.status_code >= 400:
-            raise DegradedReview(
-                f"the AI provider returned HTTP {response.status_code}"
-            )
+        if status >= 400:
+            _record(number, "failed", f"HTTP {status}", started)
+            raise _with_sends(DegradedReview(f"the AI provider returned HTTP {status}"), sends)
 
         try:
             payload = response.json()
         except ValueError:
-            raise DegradedReview("the AI provider returned a non-JSON body")
+            _record(number, "failed", "non-JSON body", started)
+            raise _with_sends(DegradedReview("the AI provider returned a non-JSON body"), sends)
 
         text = extract(payload)
+        usage = _usage(config.llm_provider, payload)
         if not text.strip():
-            raise DegradedReview("the AI provider returned an empty response")
-        return text
+            _record(number, "failed", "empty response", started, usage)
+            raise _with_sends(DegradedReview("the AI provider returned an empty response"), sends)
+        _record(number, "ok", "", started, usage, text)
+        return LlmText(text, usage=usage, sends=sends)
 
-    raise DegradedReview(
-        f"the AI provider was unreachable after {RETRY_ATTEMPTS} attempts ({last_detail})"
+    raise _with_sends(
+        DegradedReview(
+            f"the AI provider was unreachable after {RETRY_ATTEMPTS} attempts ({last_detail})"
+        ),
+        sends,
     )
 
 

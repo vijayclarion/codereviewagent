@@ -16,6 +16,7 @@ from .parser import (
     claim_overlap,
     code_issue_key,
     criterion_key,
+    cross_file_key,
     fingerprint,
 )
 
@@ -157,6 +158,16 @@ def build_inline_comments(report, reviewable, mapper):
         _, resolved_line = _locate(issue.file, issue.line, reviewable, mapper)
         route("code", issue.file, issue.line, code_issue_key(issue, resolved_line), body)
 
+    # Feature 007: keyed on the files involved, which do not change when the
+    # provider rewords the finding (contracts/finding-identity.md).
+    for issue in getattr(report, "cross_file_issues", ()):
+        files = ", ".join(f"`{f}`" for f in issue.files)
+        body = (
+            f"**\U0001F517 Cross-file issue ({issue.severity})**\n\n{issue.issue}\n\n"
+            f"*Files involved*: {files}"
+        )
+        route("cross-file", issue.file, issue.line, cross_file_key(issue), body)
+
     return inline, summary_only
 
 
@@ -272,8 +283,14 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
     story_note = (
         ", ".join(f"story #{w.id}" for w in work_items) if work_items else "no linked story"
     )
+    # Feature 007: GitHub has no iterations; the head commit is what a reader
+    # can check the review against.
+    if getattr(pr_context, "platform", "tfs") == "github":
+        revision = f"commit {(pr_context.iteration_commit or '')[:7] or '-'}"
+    else:
+        revision = f"iteration {pr_context.iteration_id}"
     parts.append(
-        f"**Reviewed**: PR #{pr_context.pr_id}, iteration {pr_context.iteration_id} \u00b7 "
+        f"**Reviewed**: PR #{pr_context.pr_id}, {revision} \u00b7 "
         f"{reviewed_count} of {total} changed files \u00b7 {story_note}"
     )
     parts.append("")
@@ -355,6 +372,19 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
             parts.append(f"- **{issue.severity}** \u2014 {issue.issue}{location}")
     else:
         parts.append("None found in the reviewed diff.")
+    parts.append("")
+
+    # Feature 007: always present, with an explicit "none" - a missing section
+    # cannot be told apart from one that failed to render (module docstring).
+    cross_file = tuple(getattr(report, "cross_file_issues", ()))
+    parts.append(f"### Cross-file issues ({len(cross_file)})")
+    parts.append("")
+    if cross_file:
+        for issue in cross_file:
+            files = ", ".join(f"`{f}`" for f in issue.files)
+            parts.append(f"- **{issue.severity}** — {issue.issue}\n  Files: {files}")
+    else:
+        parts.append("None found.")
     parts.append("")
 
     if summary_only:

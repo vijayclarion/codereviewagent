@@ -23,7 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from review_agent import __version__, checklist as checklist_module
-from review_agent import diff_builder, output_layer, parser, prompt_builder, selection
+from review_agent import diff_builder, output_layer, parser, prompt_builder, selection, stories
 from review_agent.config import emit, emit_error, load_config
 from review_agent.dedupe import read_prior_feedback
 from review_agent.errors import (
@@ -39,11 +39,11 @@ from review_agent import llm_log as llm_log_module
 from review_agent.llm_adapter import call_llm
 from review_agent.models import (
     DeclaredScope,
-    PullRequestContext,
     ReviewReport,
     RunInventory,
     WorkItem,
 )
+from review_agent.platform import make_platform
 from review_agent.tfs_client import TfsClient
 
 EPILOG = """\
@@ -58,7 +58,14 @@ configuration:
              CHECKLIST_BRANCH
   Behaviour: DRY_RUN (default true)  FAIL_ON_CONTRADICTION (default false)
   Scope:     REVIEW_EXCLUDE_PATTERNS REVIEW_EXCLUDE_MODE REVIEW_MAX_FILES
-             REVIEW_MAX_DIFF_LINES LLM_MAX_CHUNK_LINES
+             REVIEW_MAX_DIFF_LINES LLM_MAX_PROMPT_TOKENS LLM_MAX_OUTPUT_TOKENS
+             LLM_MAX_CHUNK_LINES (optional cap)
+  Platform:  PLATFORM (tfs | github, default tfs)  STORY_SOURCE (tfs |
+             github-issues | none, default: the platform's own)
+  GitHub:    GH_REPOSITORY GH_PR_NUMBER GH_TOKEN (aliases GITHUB_TOKEN,
+             GIT_REPO_TOKEN)  GH_TOKEN_FOR_PR (to post)  GH_API_URL
+             GH_CHECKLIST_REPO GH_CHECKLIST_TOKEN GH_AGENT_REPO
+  Cost:      LLM_PRICE_INPUT_PER_MTOK LLM_PRICE_OUTPUT_PER_MTOK LLM_PRICE_CURRENCY
 
 exit codes:
   0  review completed or degraded (default - never blocks a merge)
@@ -108,32 +115,15 @@ NO_STORY_LINKED = "no work item is linked to this pull request"
 
 
 def _fetch_story(client, log):
-    """Linked work items, and the reason when there are none (FR-022, FR-023).
+    """Linked TFS work items, and the reason when there are none.
 
-    A credential that cannot read work items used to raise out of here and exit
-    2, taking the checklist half of the review with it. That is worse than the
-    silence it was recorded as: a review that could have said something useful
-    said nothing at all, and the build went red for a reason that had nothing to
-    do with the code. Now the story half is lost, loudly, and the rest runs.
+    Feature 007 moved the logic to `stories.fetch_tfs` unchanged; this name stays
+    because the suite and earlier documents refer to it.
     """
-    try:
-        ids = client.get_linked_work_item_ids()
-        work_items = []
-        ordinal = 1
-        for work_item_id in ids:
-            payload = client.get_work_item(work_item_id)
-            item = WorkItem.from_payload(payload, ordinal_start=ordinal)
-            ordinal += max(len(item.criteria), 1)
-            work_items.append(item)
-    except WorkItemAccessDenied as exc:
-        log.phase("workitems", outcome="degraded", count=0, criteria=0)
-        return (), exc.describe()
-
-    log.phase("workitems", count=len(work_items), criteria=sum(len(w.criteria) for w in work_items))
-    return tuple(work_items), "" if work_items else NO_STORY_LINKED
+    return stories.fetch_tfs(client, log)
 
 
-def _report_degraded(config, reason, client, prior, log):
+def _report_degraded(config, reason, platform, prior, log):
     """Say on the pull request that the review could not run, and why (FR-029).
 
     Silence would be indistinguishable from a clean review, which is the one
@@ -146,10 +136,7 @@ def _report_degraded(config, reason, client, prior, log):
         log.phase("post", outcome="dry-run", summary="degraded")
         return
     try:
-        if prior and prior.summary_thread_id and prior.summary_comment_id:
-            client.update_comment(prior.summary_thread_id, prior.summary_comment_id, markdown)
-        else:
-            client.create_thread(markdown)
+        platform.post_summary(markdown, prior)
         log.phase("post", outcome="degraded", summary="posted")
     except Exception as exc:
         # Losing the notice is not worth turning a degraded run into a red build.
@@ -215,32 +202,34 @@ def run_review(config, log, agent_source=""):
         model=config.llm_model,
         agent_source=agent_source,
     )
-    client = TfsClient(config)
+    # Feature 007: the hosting platform. `TfsClient` is looked up here, at call
+    # time, so a test that replaces `main.TfsClient` is the one that runs.
+    client = make_platform(config, tfs_factory=TfsClient)
+    # Feature 007 (D15): tokens and cost, accumulated whether or not logging is on.
+    usage = llm_log_module.RunUsage.for_config(config)
 
-    pr_payload = client.get_pull_request()
-    pr_context = PullRequestContext.from_payload(config.tfs_pr_id, pr_payload)
+    pr_context = client.get_pull_request_context()
     declared_scope = DeclaredScope.from_description(pr_context.description)
     log.phase(
         "pullrequest",
         source=pr_context.source_branch or "-",
         target=pr_context.target_branch or "-",
         scope="parsed" if declared_scope.parsed else "absent",
+        platform=pr_context.platform if pr_context.platform != "tfs" else None,
+        draft=pr_context.is_draft if pr_context.platform != "tfs" else None,
     )
 
-    work_items, story_reason = _fetch_story(client, log)
+    story_outcome = stories.fetch_stories(config, client, log)
+    work_items, story_reason = story_outcome.work_items, story_outcome.reason
 
     corpus, checklist = _fetch_checklist(client, config, log)
 
-    iterations = client.get_iterations()
-    if not iterations:
-        raise DegradedReview("the pull request has no iterations to review")
-    iteration_id, head, base = diff_builder.resolve_iteration(iterations, pr_payload)
-    pr_context = pr_context.with_iteration(iteration_id, head, base)
+    revision = client.get_revision()
+    pr_context = pr_context.with_iteration(revision.iteration_id, revision.head, revision.base)
     log.set_run_id(pr_context.run_id)
     llm_session.set_run_id(pr_context.run_id)
 
-    change_payload = client.get_iteration_changes(iteration_id)
-    entries = (change_payload or {}).get("changeEntries", []) or []
+    entries = client.get_changed_files(revision)
     change_set, pre_skipped = diff_builder.build_change_set(client, pr_context, entries)
     reviewable = selection.select_reviewable(
         change_set, config, work_items=work_items, checklist=checklist, pre_skipped=pre_skipped
@@ -268,6 +257,9 @@ def run_review(config, log, agent_source=""):
     log.phase("prior", posted=len(prior.posted_fingerprints), summary=bool(prior.summary_thread_id))
 
     notes = []
+    if pr_context.is_draft:
+        notes.append("This pull request is a draft; it was reviewed because it was asked for.")
+    notes.extend(f"Story source: {note}." for note in story_outcome.notes)
     if story_reason:
         notes.append(
             f"No story coverage was assessed: {story_reason}. This is a "
@@ -292,19 +284,28 @@ def run_review(config, log, agent_source=""):
             report, inventory=_build_inventory(corpus, work_items, story_reason, report)
         )
         log.phase("llm", outcome="skipped", chunks=0)
-        llm_session.close("no exchange")
+        llm_session.close("no exchange", usage)
         _deliver(config, report, work_items, pr_context, reviewable, client, prior, log)
         return report
 
-    prompts = prompt_builder.build_prompts(
+    # Feature 007: chunks are planned by token budget, and every prompt carries
+    # the PR outline. The plan and outline are kept for the synthesis pass.
+    review = prompt_builder.build_review(
         work_items, declared_scope, checklist, reviewable, pr_context, config
+    )
+    prompts = review.prompts
+    log.phase(
+        "plan",
+        chunks=len(prompts),
+        budget=review.plan.budget_tokens,
+        groups=len(review.plan.groups),
     )
 
     results, retries = [], 0
     try:
         for chunk_index, prompt in enumerate(prompts, start=1):
             send = _recording_sender(
-                config, llm_session, chunk_index, len(prompts)
+                config, llm_session, chunk_index, len(prompts), usage=usage
             )
             result, used_retry = parser.parse_with_retry(
                 prompt,
@@ -318,8 +319,11 @@ def run_review(config, log, agent_source=""):
         # The provider was unreachable, or its response was unusable after the
         # retry. Say so on the pull request and exit 0 - an outage must not gate
         # a merge (FR-029).
-        log.phase("llm", outcome="degraded", chunks=len(prompts), retries=retries)
-        llm_session.close("degraded")
+        log.phase(
+            "llm", outcome="degraded", chunks=len(prompts), retries=retries, **_usage_extras(usage)
+        )
+        llm_session.close("degraded", usage)
+        emit(f"llm usage: {usage.describe()}")
         _report_degraded(config, exc.message, client, prior, log)
         degraded = ReviewReport(
             summary=f"The review could not be completed: {exc.message}",
@@ -332,32 +336,100 @@ def run_review(config, log, agent_source=""):
         return replace(
             degraded,
             inventory=_build_inventory(corpus, work_items, story_reason, degraded),
+            usage=usage,
         )
-    log.phase("llm", chunks=len(prompts), retries=retries)
+    log.phase("llm", chunks=len(prompts), retries=retries, **_usage_extras(usage))
 
     merged = parser.merge_results(results)
+    merged, synthesis_state = _synthesise(
+        config, llm_session, review, work_items, merged, notes, log, usage
+    )
     # The APPLIED checklist, which may be the text path's - resolution only
     # applies where there are identifiers to resolve against.
     report = parser.build_report(
         merged, declared_scope, work_items, reviewable, notes, corpus=checklist
     )
     report = replace(
-        report, inventory=_build_inventory(corpus, work_items, story_reason, report)
+        report,
+        inventory=_build_inventory(corpus, work_items, story_reason, report),
+        synthesis=synthesis_state,
+        usage=usage,
     )
     log.phase(
         "parse",
         coverage=len(report.coverage),
         violations=len(report.checklist_violations),
         issues=len(report.code_issues),
+        cross_file=len(report.cross_file_issues),
         false_claims=len(report.false_coverage_claims),
     )
 
-    llm_session.close("complete")
+    llm_session.close("complete", usage)
+    emit(f"llm usage: {usage.describe()}")
     _deliver(config, report, work_items, pr_context, reviewable, client, prior, log)
     return report
 
 
-def _recording_sender(config, llm_session, chunk_index, chunk_total):
+SYNTHESIS_INCOMPLETE = "Synthesis did not complete: {reason}. Cross-file issues may be missing."
+
+
+def _usage_extras(usage):
+    """`tokens_in= tokens_out= cost=` for the phase line - omitted with no call."""
+    if not usage.calls:
+        return {}
+    cost = usage.cost
+    return {
+        "tokens_in": usage.input_tokens,
+        "tokens_out": usage.output_tokens,
+        "cost": f"{cost:.4f}{usage.currency}" if cost is not None else "n/a",
+    }
+
+
+def _synthesise(config, llm_session, review, work_items, merged, notes, log, usage=None):
+    """The one extra call of a multi-chunk review (feature 007, D12).
+
+    Returns (merged results, synthesis state). A failure here costs the
+    synthesis and nothing else: the per-chunk findings came from seeing the
+    code and stand on their own (FR-020).
+    """
+    if len(review.prompts) <= 1:
+        return merged, "not needed"
+    prompt = prompt_builder.build_synthesis_prompt(
+        review.outline, work_items, merged, merged.get("change_notes", [])
+    )
+    send = _recording_sender(
+        config, llm_session, len(review.prompts), len(review.prompts), kind="synthesis",
+        usage=usage,
+    )
+    try:
+        synthesis, _retried = parser.parse_synthesis_with_retry(
+            prompt, send, prompt_builder.STRICTER_RETRY
+        )
+    except DegradedReview as exc:
+        log.phase("synthesis", outcome="failed")
+        notes.append(SYNTHESIS_INCOMPLETE.format(reason=exc.message))
+        return merged, f"failed: {exc.message}"
+    log.phase("synthesis", cross_file=len(synthesis["cross_file_issues"]))
+    return parser.apply_synthesis(merged, synthesis), "complete"
+
+
+def _log_exchange(llm_session, **fields):
+    """Build and append one record, inside the session's guard.
+
+    Feature 007 (D16): building a record can fail too - an invariant, an odd
+    value - and logging must never be the reason a review fails.
+    """
+    if not llm_session.enabled:
+        return
+    llm_session._guarded(
+        lambda: llm_session.record(
+            llm_log_module.ExchangeRecord(index=llm_session.count + 1, **fields)
+        ),
+        "build a log entry",
+    )
+
+
+def _recording_sender(config, llm_session, chunk_index, chunk_total, kind="review", usage=None):
     """The provider callable for one chunk, recording each send (feature 006).
 
     `parse_with_retry` calls this once, or twice when the first response will
@@ -365,11 +437,64 @@ def _recording_sender(config, llm_session, chunk_index, chunk_total):
     exchanges and both are recorded, which is what makes an unparseable run
     explainable after the fact.
 
+    Feature 007: `call_llm` returns an `LlmText` (or raises an error) carrying
+    `.sends` - one entry per HTTP attempt - and the provider's own usage. Each
+    send becomes its own record, so a timeout followed by success is two
+    entries; and each send's usage is added to the run's totals. A test fake
+    returns a plain `str` with neither, and gets exactly one record, as before.
+
     `call_llm` is looked up on the module at call time, never captured: seven
     tests replace `main.call_llm` with a fake, and a captured reference would
     silently ignore every one of them.
     """
     state = {"attempt": 0}
+    common = {
+        "chunk": chunk_index,
+        "chunk_total": chunk_total,
+        "kind": kind,
+        "provider": getattr(config, "llm_provider", "") or "",
+        "model": getattr(config, "llm_model", "") or "",
+    }
+
+    def _record_all(text, sent_at, started, sends, final_failure=None, response=""):
+        attempt = state["attempt"]
+        if not sends:
+            if usage is not None:
+                usage.add()
+            if final_failure is not None:
+                _log_exchange(
+                    llm_session, attempt=attempt, sent_at=sent_at,
+                    elapsed_ms=int((time.monotonic() - started) * 1000), prompt=text,
+                    outcome="failed", failure=final_failure, **common,
+                )
+            else:
+                _log_exchange(
+                    llm_session, attempt=attempt, sent_at=sent_at,
+                    elapsed_ms=int((time.monotonic() - started) * 1000), prompt=text,
+                    outcome="ok", response=response, **common,
+                )
+            return
+        last = len(sends) - 1
+        for position, record in enumerate(sends):
+            tokens = record.usage
+            input_tokens = getattr(tokens, "input", None)
+            output_tokens = getattr(tokens, "output", None)
+            if usage is not None:
+                usage.add(input_tokens, output_tokens)
+            if record.outcome == "ok":
+                fields = {"outcome": "ok", "response": record.text or str(response)}
+            else:
+                reason = record.detail
+                if record.outcome == "retried":
+                    reason = f"{record.detail} - retried"
+                elif position == last and final_failure:
+                    reason = final_failure
+                fields = {"outcome": "failed", "failure": reason}
+            _log_exchange(
+                llm_session, attempt=attempt, send=min(record.number, 3), sent_at=sent_at,
+                elapsed_ms=record.elapsed_ms, prompt=text,
+                input_tokens=input_tokens, output_tokens=output_tokens, **common, **fields,
+            )
 
     def send(text):
         state["attempt"] = min(state["attempt"] + 1, 2)
@@ -378,33 +503,9 @@ def _recording_sender(config, llm_session, chunk_index, chunk_total):
         try:
             response = call_llm(text, config)
         except ReviewAgentError as exc:
-            llm_session.record(
-                llm_log_module.ExchangeRecord(
-                    index=llm_session.count + 1,
-                    chunk=chunk_index,
-                    chunk_total=chunk_total,
-                    attempt=state["attempt"],
-                    sent_at=sent_at,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    prompt=text,
-                    outcome="failed",
-                    failure=exc.message,
-                )
-            )
+            _record_all(text, sent_at, started, getattr(exc, "sends", None), final_failure=exc.message)
             raise  # unchanged: same type, same message (FR-017)
-        llm_session.record(
-            llm_log_module.ExchangeRecord(
-                index=llm_session.count + 1,
-                chunk=chunk_index,
-                chunk_total=chunk_total,
-                attempt=state["attempt"],
-                sent_at=sent_at,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
-                prompt=text,
-                outcome="ok",
-                response=response,
-            )
-        )
+        _record_all(text, sent_at, started, getattr(response, "sends", None), response=response)
         return response
 
     return send
@@ -425,7 +526,7 @@ def _deliver(config, report, work_items, pr_context, reviewable, client, prior, 
         )
         return plan
 
-    posted = output_layer.post_plan(plan, client, prior)
+    posted = client.deliver(plan, prior, pr_context)
     log.phase(
         "post",
         inline=posted,

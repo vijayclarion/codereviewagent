@@ -1,0 +1,148 @@
+# AI code review - the central, reusable workflow (feature 007).
+#
+# Any repository calls this with a ~20-line caller (see docs/github-setup.md):
+#
+#   jobs:
+#     review:
+#       uses: vijayclarion/codereviewagent/.github/workflows/code-review.yml@master
+#
+# Authority: reads of the pull request and its issues, and every comment
+# posted, use this job's own GITHUB_TOKEN - so the `permissions:` block below
+# IS the agent's authority on the calling repository. `review_bot_token` is used
+# for one thing only: cloning the checklist repository, which GITHUB_TOKEN
+# cannot read when that repository is private.
+#
+# The prompt/response log, when enabled, contains the pull request's source
+# code. It is uploaded as a 3-day artifact, and only when asked for.
+
+name: AI code review (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: LLM model identifier (not a secret)
+        type: string
+        required: true
+      llm_provider:
+        description: claude | openai | azure | ollama
+        type: string
+        default: claude
+      story_source:
+        description: github-issues | none
+        type: string
+        default: github-issues
+      checklist_repo:
+        description: owner/name of the checklist repository
+        type: string
+        required: true
+      dry_run:
+        description: true prints the review in the job log and posts nothing
+        type: boolean
+        default: true
+      llm_log:
+        description: upload the prompt/response log (contains source code)
+        type: boolean
+        default: false
+      fail_on_contradiction:
+        description: fail the job on a possible contradiction or a high-severity finding
+        type: boolean
+        default: false
+      agent_repository:
+        description: where the agent's code lives (a called workflow cannot ask for its own)
+        type: string
+        default: vijayclarion/codereviewagent
+      agent_ref:
+        description: branch, tag or SHA of the agent - keep it equal to the ref after `@`
+        type: string
+        default: master
+    secrets:
+      llm_api_key:
+        required: true
+      review_bot_token:
+        description: Contents (read) on the checklist repository; optional when it is public
+        required: false
+
+jobs:
+  review:
+    name: AI review
+    # Drafts are not reviewed, and neither is code from a fork: a fork's code
+    # must never run with this repository's secrets.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    concurrency:
+      group: ai-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out the agent
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.agent_repository }}
+          ref: ${{ inputs.agent_ref }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: review_agent/requirements.txt
+
+      - name: Install the agent's dependencies
+        run: python -m pip install --disable-pip-version-check -r review_agent/requirements.txt
+
+      - name: Review the pull request
+        env:
+          PLATFORM: github
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN_FOR_PR: ${{ github.token }}
+          GH_CHECKLIST_TOKEN: ${{ secrets.review_bot_token || github.token }}
+          GH_CHECKLIST_REPO: ${{ inputs.checklist_repo }}
+          STORY_SOURCE: ${{ inputs.story_source }}
+          LLM_PROVIDER: ${{ inputs.llm_provider }}
+          LLM_MODEL: ${{ inputs.model }}
+          LLM_API_KEY: ${{ secrets.llm_api_key }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          LLM_LOG: ${{ inputs.llm_log }}
+          LLM_LOG_DIR: ${{ github.workspace }}/.llm-logs
+          FAIL_ON_CONTRADICTION: ${{ inputs.fail_on_contradiction }}
+        # Exit 0: reviewed or degraded. Exit 1: blocking findings (only with
+        # fail_on_contradiction). Exit 2: setup failure. Nothing masks them.
+        run: python -m review_agent --local
+
+      - name: Upload the prompt/response log (contains source code)
+        if: always() && inputs.llm_log
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-log-pr-${{ github.event.pull_request.number }}
+          path: ${{ github.workspace }}/.llm-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  skipped:
+    name: AI review skipped
+    if: >-
+      github.event.pull_request.draft == true ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Say why
+        env:
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "AI review skipped: draft pull request. Mark it ready for review to run it."
+          else
+            echo "AI review skipped: pull request from a fork - secrets are not exposed to fork code."
+          fi
