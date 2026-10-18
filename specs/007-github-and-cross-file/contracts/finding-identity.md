@@ -45,3 +45,8 @@ both applying to TFS and GitHub alike:
 
 Regression tests: `tests/unit/test_dedupe_live_repeats.py`, using the provider's own texts
 from the two live runs.
+3. **A code issue restating a posted cross-file issue is recognised.** The third live run
+   (attempt 5) reported the `Save` mismatch as a high *code issue* on `CartController.cs`,
+   having reported it as a *cross-file issue* (posted on `Interfaces.cs`, naming both files)
+   before. A code comment now counts as already said when a posted cross-file comment names
+   its file and their wording overlaps by at least 0.3.

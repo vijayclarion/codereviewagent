@@ -510,9 +510,20 @@ def _already_said(comment, prior):
     here = comment.path.lstrip("/").replace("\\", "/").lower()
     detail = _detail(comment.body)
     for kind, path, text in getattr(prior, "posted_texts", ()):
-        if kind != comment.kind or path != here:
-            continue
-        if claim_overlap(detail, _detail(text)) >= SAME_FINDING_OVERLAP:
+        if kind == comment.kind and path == here:
+            if claim_overlap(detail, _detail(text)) >= SAME_FINDING_OVERLAP:
+                return True
+        # Feature 007 (live run T090, attempt 5): the provider reported a
+        # signature mismatch as a cross-file issue on one run and as a code
+        # issue on the next. A cross-file comment is posted on ONE of its files
+        # but names them all, so it counts for every file it names.
+        elif (
+            comment.kind == "code"
+            and kind == "cross-file"
+            and here
+            and here in text.replace("\\", "/").lower()
+            and claim_overlap(detail, _detail(text)) >= SAME_FINDING_OVERLAP
+        ):
             return True
     return False
 

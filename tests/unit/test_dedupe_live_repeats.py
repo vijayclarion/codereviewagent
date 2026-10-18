@@ -114,3 +114,59 @@ def test_a_genuinely_different_checklist_violation_in_the_same_file_is_still_pos
     run1 = _plan(ReviewReport(checklist_violations=(tests,)))
     run2 = _plan(ReviewReport(checklist_violations=(clock,)), _prior_from(run1))
     assert [c.kind for c in run2.inline] == ["checklist"]
+
+
+# -- Attempt 5: the same defect under a different kind -------------------------
+
+CONTROLLER = "src/eShop.Api/Controllers/CartController.cs"
+INTERFACES = "src/eShop.Api/Services/Interfaces.cs"
+CROSS_FILE_TEXT = (
+    "`ICartRepository.Save` signature was changed from `Save(Cart cart)` to "
+    "`Save(Cart cart, string appliedCouponCode)`, but `CartController.cs` still calls "
+    "`_carts.Save(cart);` with the old single-argument form, which will not compile against "
+    "the new interface."
+)
+CODE_TEXT = (
+    "`_carts.Save(cart);` is still called with a single argument even though "
+    "`ICartRepository.Save` now requires `Save(Cart cart, string appliedCouponCode)` - this "
+    "will not compile."
+)
+
+
+def _reviewable_two():
+    def one(path, n):
+        before = "".join(f"line {i}\n" for i in range(1, 80))
+        after = before.replace(f"line {n}\n", f"line {n}\nadded\n")
+        diff, line_map, changed = build_file_diff(path, before, after)
+        return ChangedFile("/" + path, diff=diff, line_map=line_map, changed_lines=changed)
+
+    return ReviewableSet(reviewed=(one(INTERFACES, 7), one(CONTROLLER, 69)))
+
+
+def test_a_code_issue_restating_a_posted_cross_file_issue_is_recognised():
+    from review_agent.models import CodeIssue, CrossFileIssue
+
+    cross = CrossFileIssue("high", CROSS_FILE_TEXT, files=("/" + INTERFACES, "/" + CONTROLLER),
+                           file=INTERFACES, line=8)
+    run1 = output_layer.build_plan(ReviewReport(cross_file_issues=(cross,)), (), CTX,
+                                   _reviewable_two(), map_line)
+    assert [c.kind for c in run1.inline] == ["cross-file"]
+    assert run1.inline[0].path.endswith("Interfaces.cs")
+
+    code = CodeIssue("high", CODE_TEXT, file=CONTROLLER, line=70)
+    run2 = output_layer.build_plan(ReviewReport(code_issues=(code,)), (), CTX,
+                                   _reviewable_two(), map_line, _prior_from(run1))
+    assert run2.inline == () and [c.kind for c in run2.suppressed] == ["code"]
+
+
+def test_a_code_issue_in_a_file_the_cross_file_issue_does_not_name_is_still_posted():
+    from review_agent.models import CodeIssue, CrossFileIssue
+
+    cross = CrossFileIssue("high", CROSS_FILE_TEXT, files=("/" + INTERFACES, "/other/Unrelated.cs"),
+                           file=INTERFACES, line=8)
+    run1 = output_layer.build_plan(ReviewReport(cross_file_issues=(cross,)), (), CTX,
+                                   _reviewable_two(), map_line)
+    code = CodeIssue("high", CODE_TEXT, file=CONTROLLER, line=70)
+    run2 = output_layer.build_plan(ReviewReport(code_issues=(code,)), (), CTX,
+                                   _reviewable_two(), map_line, _prior_from(run1))
+    assert [c.kind for c in run2.inline] == ["code"]
