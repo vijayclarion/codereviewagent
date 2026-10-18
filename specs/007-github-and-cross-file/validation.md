@@ -83,3 +83,21 @@ scratchpad and run locally - nothing was sent to a public server.
 | T094 (Q1) | Approved by the requester. TFS posts with `TFS_PAT_FOR_PR` from a client built only when posting. **851 passed** |
 | T083 | Sample source read (C#: `ICartRepository`, `ICatalogService`, `CartController`, `Cart`). Demo violation chosen: **DEV-STD-06 Deterministic Time Handling** (`DateTime.Now` in business logic). The sample has no `ICartService`; the demo's cross-file defect is a signature change to `ICartRepository.Save` |
 | T082 push | **Blocked.** `origin` added (`https://github.com/vijayclarion/codereviewagent`, no credential in the URL); `git fetch` succeeded; `git push -u origin 007-github-and-cross-file` refused: `Permission to vijayclarion/codereviewagent.git denied` (HTTP 403). The repository API reports the *account* as admin, but the fine-grained `GIT_REPO_TOKEN` itself evidently lacks Contents (write). Stopped per FR-041; T084-T093 depend on it. History scan of `7eddb98..HEAD` before the attempt: 0 secret hits |
+| T082 (retry, after the token was fixed) | Pushed `007-github-and-cross-file`; history scan 0 hits. **PR https://github.com/vijayclarion/codereviewagent/pull/1** |
+| T084 | Sample branch `ai-review-setup` (caller workflow + issue template; `.gitignore` already had `.env`). **PR https://github.com/vijayclarion/codereviewsample/pull/1**. Its workflow run fails until `AI_REVIEW_LLM_API_KEY` is set (expected) |
+| T085 | **Issue https://github.com/vijayclarion/codereviewsample/issues/2** "Apply a coupon when adding an item to the cart", 3 criteria |
+| T086 | Branch `demo/cart-coupon` from `ai-review-setup`. **PR https://github.com/vijayclarion/codereviewsample/pull/3** ("Closes #2") |
+| T092 | Checklist branch `add-gitignore`. **PR https://github.com/vijayclarion/codereviewchecklist/pull/1** |
+| T087 GitHub live preview of PR #3 | **Stopped at the model call: the provider rejected `LLM_API_KEY` (HTTP 401), exit 2.** Everything before it worked live: PR read (`platform=github draft=False`), issue #2 found with 3 criteria (`source=github-issues count=1 criteria=3`), checklist cloned (5 documents, 140 rules), 5 files diffed against the merge base (60 changed lines), prior comments read (`posted=0`), planned as 1 chunk (budget 97,465 tokens, 4 groups). The log recorded the failed send with `model    : claude / claude-sonnet-5`, `tokens   : not reported` and the reason. The outline row for `Interfaces.cs` read `removed: void Save(Cart cart) / added: void Save(Cart cart, string appliedCouponCode)`. Not worked around (FR-041) |
+
+### Demo PR #3: the defects planted, and what the review should report
+
+Kept here rather than in the PR description, which is sent to the model.
+
+| Planted | Where | Expected finding |
+|---|---|---|
+| `ICartRepository.Save(Cart)` became `Save(Cart, string appliedCouponCode)`; `CartController` still calls `_carts.Save(cart)` | `Interfaces.cs`, `CartController.cs` | **cross-file issue** naming both files |
+| `cart.CouponAppliedAt = DateTime.Now;` in the controller | `CartController.cs` | **checklist violation DEV-STD-06** (Deterministic Time Handling) |
+| The discount is applied **after** `_carts.Save(cart)` | `CartController.cs` | criterion 3 **possible contradiction**; the description's "Covered" claim for it is a **false coverage claim** |
+| Unknown/expired coupons are not rejected (declared "Not in this PR") | - | criterion 2 **not addressed** (neutral, no comment) |
+| The coupon code is stored on the cart | `CartController.cs`, `Cart.cs` | criterion 1 **appears addressed** |
