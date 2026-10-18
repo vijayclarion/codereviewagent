@@ -170,3 +170,22 @@ def test_a_code_issue_in_a_file_the_cross_file_issue_does_not_name_is_still_post
     run2 = output_layer.build_plan(ReviewReport(code_issues=(code,)), (), CTX,
                                    _reviewable_two(), map_line, _prior_from(run1))
     assert [c.kind for c in run2.inline] == ["code"]
+
+
+# -- Attempt 6: the same cross-file issue, anchored on its other file ----------
+
+
+def test_a_cross_file_issue_anchored_on_another_of_its_files_is_recognised():
+    from review_agent.models import CrossFileIssue
+
+    files = ("/" + INTERFACES, "/" + CONTROLLER)
+    on_interface = CrossFileIssue("high", CROSS_FILE_TEXT, files=files, file=INTERFACES, line=8)
+    run1 = output_layer.build_plan(ReviewReport(cross_file_issues=(on_interface,)), (), CTX,
+                                   _reviewable_two(), map_line)
+    assert run1.inline[0].path.endswith("Interfaces.cs")
+
+    on_controller = CrossFileIssue("high", "Reworded: the controller still calls Save(cart).",
+                                   files=files, file=CONTROLLER, line=70)
+    run2 = output_layer.build_plan(ReviewReport(cross_file_issues=(on_controller,)), (), CTX,
+                                   _reviewable_two(), map_line, _prior_from(run1))
+    assert run2.inline == () and [c.kind for c in run2.suppressed] == ["cross-file"]

@@ -50,3 +50,7 @@ from the two live runs.
    having reported it as a *cross-file issue* (posted on `Interfaces.cs`, naming both files)
    before. A code comment now counts as already said when a posted cross-file comment names
    its file and their wording overlaps by at least 0.3.
+4. **A cross-file issue may move its anchor.** The fourth live run (attempt 6) anchored the
+   same cross-file issue (same file set) on `CartController.cs` instead of `Interfaces.cs`.
+   Its fingerprint includes the anchor, so it is now also recognised when the fingerprint
+   for *any* of the files it names was already posted.

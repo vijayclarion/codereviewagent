@@ -539,6 +539,14 @@ def build_plan(report, work_items, pr_context, reviewable, mapper, prior=None):
         # Feature 007: reported summary-only on an earlier run, located now.
         if comment.identity and location_free_fingerprint(comment.kind, comment.identity) in posted:
             return True
+        # Feature 007 (live run T090, attempt 6): a cross-file issue may be
+        # anchored on any of the files it names, and the provider moved the
+        # anchor between runs. Its identity lists every file, so any of them
+        # as the anchor is the same finding.
+        if comment.kind == "cross-file" and comment.identity:
+            if any(fingerprint("cross-file", f, comment.identity) in posted
+                   for f in comment.identity.split("|")):
+                return True
         return _already_said(comment, prior)
 
     fresh = [c for c in inline if not seen(c)]
