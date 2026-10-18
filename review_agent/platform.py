@@ -17,6 +17,7 @@ directly; it is imported only when a run asks for it.
 contracts/platform-client.md is the method-by-method contract.
 """
 
+import inspect
 from typing import Protocol
 
 from . import output_layer
@@ -55,10 +56,17 @@ class TfsPlatform:
 
     name = "tfs"
 
-    def __init__(self, client, config):
+    def __init__(self, client, config, writer=None):
         self.client = client
         self.config = config
+        #: Feature 007 (Q1, T094): the client holding the posting credential,
+        #: built only for a run that will post. Writes go to it; reads never do.
+        self.writer = writer
         self._pr_payload = None
+
+    @property
+    def _poster(self):
+        return self.writer if self.writer is not None else self.client
 
     # -- reads -----------------------------------------------------------
 
@@ -100,17 +108,29 @@ class TfsPlatform:
     def post_summary(self, markdown, prior):
         """The degraded notice: edit the summary in place, or start one."""
         if prior and prior.summary_thread_id and prior.summary_comment_id:
-            return self.client.update_comment(
+            return self._poster.update_comment(
                 prior.summary_thread_id, prior.summary_comment_id, markdown
             )
-        return self.client.create_thread(markdown)
+        return self._poster.create_thread(markdown)
 
     def deliver(self, plan, prior, pr_context=None):
-        return output_layer.post_plan(plan, self.client, prior)
+        return output_layer.post_plan(plan, self._poster, prior)
 
     @property
     def write_count(self):
-        return getattr(self.client, "write_count", 0)
+        count = getattr(self.client, "write_count", 0)
+        if self.writer is not None and self.writer is not self.client:
+            count += getattr(self.writer, "write_count", 0)
+        return count
+
+
+def _accepts_purpose(factory):
+    """Whether a client factory can build a posting client (`TfsClient` can;
+    the suite's `lambda config: fake` stand-ins cannot, and keep one client)."""
+    try:
+        return "purpose" in inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def make_platform(config, tfs_factory):
@@ -123,4 +143,10 @@ def make_platform(config, tfs_factory):
         from .github_client import make_github_platform
 
         return make_github_platform(config)
-    return TfsPlatform(tfs_factory(config), config)
+    reader = tfs_factory(config)
+    writer = None
+    # Q1 / T094: TFS posts with TFS_PAT_FOR_PR, from a client that exists only
+    # when the run will post - the design feature 002 intended (research E3).
+    if not getattr(config, "dry_run", True) and _accepts_purpose(tfs_factory):
+        writer = tfs_factory(config, purpose="post")
+    return TfsPlatform(reader, config, writer=writer)

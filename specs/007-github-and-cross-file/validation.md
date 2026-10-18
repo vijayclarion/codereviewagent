@@ -79,3 +79,6 @@ scratchpad and run locally - nothing was sent to a public server.
 |---|---|
 | T080 preflight | `.env` holds `GIT_REPO_TOKEN`, `LLM_API_KEY`, `LLM_MODEL`, `TFS_PAT`, `TFS_PAT_FOR_PR`, `TFS_BASE_URL` (presence counted, values never read out). `gh` CLI not installed - GitHub operations use scratch REST scripts |
 | T081 TFS live preview | **Blocked, not performed.** The TFS host does not resolve from this machine (`NameResolutionError ... getaddrinfo failed`) - presumably it needs the internal network or VPN. Not worked around (FR-041) |
+| T081 decision | The requester chose not to test TFS live now ("dont test TFS now just github now"). Not performed |
+| T094 (Q1) | Approved by the requester. TFS posts with `TFS_PAT_FOR_PR` from a client built only when posting. **851 passed** |
+| T083 | Sample source read (C#: `ICartRepository`, `ICatalogService`, `CartController`, `Cart`). Demo violation chosen: **DEV-STD-06 Deterministic Time Handling** (`DateTime.Now` in business logic). The sample has no `ICartService`; the demo's cross-file defect is a signature change to `ICartRepository.Save` |

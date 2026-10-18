@@ -22,8 +22,8 @@ measured**.
 
 Facts the survey found that a reader would otherwise guess wrongly:
 
-- `TfsClient(purpose="post")` is **never built**: TFS posts with the reading token, and
-  `TFS_PAT_FOR_PR` is required but unused (E3, Q1).
+- `TfsClient(purpose="post")` was **never built** before 007: TFS posted with the reading
+  token. Q1 was approved and T094 fixed it.
 - `call_llm` discards the provider's usage figures, and its transport retries never reach
   the log (E6, E7).
 - `tests/demo/run.py` fakes `call_llm` with no `**kwargs`, so usage rides on a `str`
@@ -211,8 +211,9 @@ calls `json.dump` directly bypasses the only thing stopping a token escaping.
 - **Cross-file review**: every chunk carries a PR outline; a multi-chunk review makes one
   synthesis call. Under the default budget almost every PR is one call (measured,
   `specs/007.../validation.md`).
-- **TFS posts with the reading token** (`TFS_PAT`); `TFS_PAT_FOR_PR` is required and unused
-  (007 research E3). Fixing it is task T094, gated on the requester's answer to Q1.
+- **TFS now posts with `TFS_PAT_FOR_PR`** (007 Q1, approved 2026-10-18). Before 007 it
+  posted with the reading token and `TFS_PAT_FOR_PR` was required but unused (research E3).
+  The posting client is built only when the run will post (`platform.make_platform`).
 
 - **`checklist_docs.py` is wired in** — gap G1 is closed. `checklist.py` obtains a
   working copy of the checklist repository through `source_fetch.clone`, reads every
