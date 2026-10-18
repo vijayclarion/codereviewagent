@@ -1,0 +1,225 @@
+@startuml
+' ============================================================================
+'  CodeReviewAgent - how one pull request review flows, in local mode
+'
+'  Depicts:  python -m review_agent --local --pr <id>
+'
+'  Every box names the file that owns that stage. The methods inside each
+'  stage, and the answers to "what can it see", "what happens to a huge
+'  change" and "what happens when a model limit is exceeded", are in
+'  docs/developer-guide.md - this diagram deliberately carries no prose that
+'  the guide carries better.
+'
+'  Render with:
+'    java -jar plantuml.jar -tsvg docs/local-mode-pr-review-activity.puml
+'
+'  Use -tsvg, not PNG. The diagram is ~4180px tall and PlantUML's PNG writer
+'  silently truncates at 4096 unless you also pass -DPLANTUML_LIMIT_SIZE=8192.
+'  A truncated PNG loses the last two stages and the legend, with no warning.
+'
+'  Graphviz is NOT required - this uses the modern activity syntax on purpose.
+'
+'  The title escapes each "--" with a leading ~, because PlantUML's creole
+'  otherwise renders "--local --pr" as struck-through text.
+'
+'  [A1]-[A9] cross-reference specs/004-agent-docs-runbook/guide.md Part 4.
+' ============================================================================
+
+title Local-mode PR review - call flow\n<size:11>python -m review_agent ~--local ~--pr <id>  -  detail in docs/developer-guide.md</size>
+
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 11
+skinparam ActivityFontSize 12
+skinparam ActivityDiamondFontSize 11
+skinparam Padding 1
+skinparam ActivityBorderThickness 1
+
+start
+
+'--- 0. logic --------------------------------------------------------------
+if (0. logic | bootstrap.py\nwhich copy of the logic reviews? [A1]) then (--local)
+  :say "review logic: LOCAL WORKING COPY";
+elseif (already bootstrapped) then (child)
+  :say "review logic: FETCHED <sha>";
+else (default)
+  :clone the agent repo, re-exec inside it;
+  if (fetch failed?) then (yes)
+    #FFD9D9:exit 2 - setup failure.
+    Never falls back to local silently;
+    stop
+  else (no)
+  endif
+endif
+
+'--- 1. config -------------------------------------------------------------
+:1. config | config.py
+load .env + environment, validate, build the frozen
+Config - the one module that reads the environment;
+if (configuration usable?) then (no)
+  #FFD9D9:exit 2 - every problem reported at once;
+  stop
+else (yes)
+endif
+:log  phase=config mode=dry-run auth=basic;
+
+'--- 2. pullrequest --------------------------------------------------------
+:2. pullrequest | tfs_client.py, models.py
+GET the PR: branches, description,
+the author's declared scope;
+:log  phase=pullrequest scope=parsed;
+
+'--- 3. workitems ----------------------------------------------------------
+if (3. workitems | main.py, textutil.py\nstory linked and readable? [A3, A4]) then (yes)
+  :read work items, enumerate criteria;
+else (no / 401 / 403)
+  :record the reason - checklist-only review;
+endif
+:log  phase=workitems count=N criteria=N;
+
+'--- 4. checklists ---------------------------------------------------------
+if (4. checklists | checklist.py, checklist_docs.py\nwhich checklist path? [A2]) then (documents)
+  :clone checklist repo, read .xlsx/.docx
+  into citable rules;
+elseif (unreadable / unresolved) then (fallback)
+  :read markdown checklist files;
+else (neither)
+  :record "no checklist applied" - coverage-only;
+endif
+:log  phase=checklists documents=N rules=N skipped=N;
+
+'--- 5. iteration ----------------------------------------------------------
+:5. iteration | diff_builder.py
+GET the iterations;
+if (any iterations? [A5]) then (no)
+  #FFE9CC:exit 0 - degraded, said on the PR;
+  stop
+else (yes)
+endif
+:resolve head and base commits, set the run id;
+
+'--- 6. changes ------------------------------------------------------------
+:6. changes | diff_builder.py
+GET change entries (paths + types, not patches);
+if (per file: reviewable?) then (deleted / binary / unretrievable)
+  #E8E8E8:skipped - listed in "Not sent for review";
+else (yes)
+  :fetch BOTH complete blobs
+  (iteration commit + base commit);
+  :compute the unified diff locally -
+  3 context lines each side - and the
+  diff-line -> file-line map;
+  note right #E5F2E5
+    Whole file contents are fetched HERE
+    and then WITHHELD. Only the diff
+    travels on. An unchanged file is
+    never fetched at all.
+  end note
+endif
+
+'--- 7. selection ----------------------------------------------------------
+if (7. selection | selection.py\npath matches an exclusion?) then (yes)
+  #E8E8E8:excluded - never sent to the provider;
+else (no)
+  :rank by relevance (story x3, checklist x2,
+  source +1, ties smallest change first);
+  if (a review bound already reached?) then (yes)
+    #E8E8E8:unreviewed - listed in "Not sent for review";
+  else (no)
+    :keep for review;
+  endif
+endif
+:rank the checklist rules against the files that survived;
+:log  phase=changes reviewed=N excluded=N unreviewed=N
+log  phase=rules applied=N omitted=N;
+if (anything reviewable left? [A6]) then (no)
+  #FFE9CC:exit 0 - "nothing to review",
+  delivered like any other answer;
+  stop
+else (yes)
+endif
+
+'--- 8. prior --------------------------------------------------------------
+:8. prior | dedupe.py
+read this PR's own threads to recover what was
+already said - the agent is stateless;
+:log  phase=prior posted=N summary=bool;
+
+'--- 9. llm ----------------------------------------------------------------
+#E5F2E5:9. llm | prompt_builder.py, llm_adapter.py, parser.py
+**ASSEMBLE THE REQUEST**
+diff of the kept files (3 lines of context)
++ the linked story and its criteria
++ the PR description and declared scope
++ the selected checklist rules;
+note right #E5F2E5
+  This box is everything the model
+  ever sees. Nothing else reaches it.
+end note
+if (fits in one pass?) then (over LLM_MAX_CHUNK_LINES)
+  :split on FILE boundaries into N passes.
+  Story, scope and rules repeat in EVERY pass;
+  note right: Nothing measures tokens. The split counts changed lines.
+else (yes)
+  :one pass;
+endif
+if (every pass usable?) then (no)
+  :retry ONCE, stricter;
+  if (usable now?) then (no)
+    #FFE9CC:exit 0 - degraded [A7].
+    The WHOLE run, discarding
+    passes already parsed;
+    stop
+  else (yes)
+  endif
+else (yes)
+endif
+:log  phase=llm chunks=N retries=N;
+
+'--- 10. parse -------------------------------------------------------------
+:10. parse | parser.py
+merge the passes, resolve cited rule ids,
+number the criteria, derive false coverage claims;
+:log  phase=parse coverage=N violations=N issues=N;
+
+'--- 11. post --------------------------------------------------------------
+if (11. post | output_layer.py\nper finding: status is not_addressed?) then (yes)
+  #E8E8E8:never a comment - neutral, not a defect;
+elseif (anchors to a changed line?) then (no)
+  :summary only;
+elseif (already said on this PR? [A9]) then (yes)
+  #E8E8E8:suppressed;
+else (no)
+  :inline comment;
+endif
+:render ONE summary discussion: what was applied,
+the findings, and every file not sent with its reason;
+if (preview or post? [A8]) then (DRY_RUN)
+  :print exactly what would be posted;
+else (--post)
+  :create active threads - never resolves, never deletes;
+endif
+:log  phase=post inline=N suppressed=N summary=create|update;
+
+'--- 12. done --------------------------------------------------------------
+if (12. done | main.py\nblocking finding AND fail_on_contradiction?) then (yes)
+  #FFE9CC:exit 1;
+  stop
+else (no)
+  #CCE5CC:exit 0 - reviewed, or degraded.
+  A provider outage must never gate a merge;
+  stop
+endif
+
+legend right
+  |= |= meaning |
+  |<#FFD9D9>   | exit 2 - setup failure, nothing was reviewed |
+  |<#FFE9CC>   | the run ends early, always with a stated reason |
+  |<#CCE5CC>   | the normal end |
+  |<#E8E8E8>   | leaves the flow, and is REPORTED - never silent |
+  |<#E5F2E5>   | what the model is actually shown |
+  [A1]-[A9] cross-reference 004 guide.md Part 4.
+endlegend
+
+@enduml

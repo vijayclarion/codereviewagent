@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "T049 - the demonstration's sample work item (FR-032).",
+    "The single copy: the self-contained run loads this file, and the operator",
+    "copies these fields into the collection when creating the live work item.",
+    "Six acceptance criteria, chosen so the review has all three verdicts to give:",
+    "  1, 2, 3, 5  the change satisfies  -> appears_addressed",
+    "  4           the change does NOT satisfy, and the pull request description",
+    "              claims it does       -> the headline false coverage claim",
+    "  6           the change does not touch, and nobody claims it does",
+    "              -> not addressed, which is NEUTRAL and never a defect"
+  ],
+  "id": 4101,
+  "fields": {
+    "System.Title": "Add items to the shopping cart",
+    "System.WorkItemType": "User Story",
+    "System.State": "Active",
+    "System.Tags": "cart; checkout; demo-003",
+    "System.Description": "<div>As a shopper, I want to add items to my shopping cart so that I can buy several products in one order.</div>",
+    "Microsoft.VSTS.Common.AcceptanceCriteria": "<ul><li>Quantity must be a positive integer; a request with zero or a negative quantity is rejected with a validation error.</li><li>Adding an unknown product returns a not-found response and does not change the cart.</li><li>Adding a product already in the cart increments the quantity of the existing line instead of appending a second line.</li><li>The system must not allow adding more items than are available in stock; a request exceeding available stock is rejected.</li><li>The cart total is recalculated after a successful add, before the cart is saved.</li><li>A shopper can remove a single line from the cart without emptying it.</li></ul>"
+  }
+}

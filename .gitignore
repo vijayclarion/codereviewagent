@@ -1,0 +1,27 @@
+# Secrets - NEVER commit
+.env
+.env.local
+*.pem
+*.key
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Prompt/response logs - hold the pull request's full source diff
+.llm-logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
