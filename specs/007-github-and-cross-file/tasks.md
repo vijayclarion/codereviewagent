@@ -198,13 +198,13 @@ edited in place, TFS unchanged.
 - [X] T084 [US7] ⚠ confirm — Sample repository, branch `ai-review-setup` from `master`: copy `sample-repo/.github/workflows/ai-review.yml` and `sample-repo/.github/ISSUE_TEMPLATE/user-story.md`; ensure `.gitignore` contains `.env`; commit, push, open PR "Add AI review caller workflow and user-story template"
 - [X] T085 [US7] ⚠ confirm — Create the sample issue in `codereviewsample` from the template: title "Add item to cart with coupon", Description, and exactly three `- [ ]` acceptance criteria (one the demo implements, one it leaves unaddressed, one it contradicts); record its number
 - [X] T086 [US7] ⚠ confirm — Branch `demo/cart-coupon` **from `ai-review-setup`** (so the `pull_request` run uses the caller workflow): change `ICartService.AddItem` in `src/eShop.Api/Services/Interfaces.cs` to add `string couponCode` and leave `CartController.cs` calling the old signature (the deliberate cross-file defect); add the one checklist violation from T083 in `CartController.cs`; PR body with `Closes #<issue>` and a Covered / Not in this PR section; push; open the PR against `master`
-- [ ] T087 [US7] GitHub live preview from this machine: `PLATFORM=github GH_REPOSITORY=vijayclarion/codereviewsample GH_CHECKLIST_REPO=vijayclarion/codereviewchecklist python -m review_agent --local --dry-run --log-llm --pr <demo PR>` → zero writes, three criterion verdicts, the cross-file finding, the checklist violation, real token counts in the log; record in `validation.md` (SC-002 GitHub half)
-- [ ] T088 [US7] Hand the requester the secrets list (plan.md "Secrets") and wait until they confirm `AI_REVIEW_LLM_API_KEY` (and optionally `AI_REVIEW_BOT_TOKEN`) are set on `codereviewsample`; do not proceed, and do not work around, if they are not (FR-041)
-- [ ] T089 [US7] Observe the workflow run on the demo PR (triggered by the push or by re-running): job green, inline comments on the defect lines in **one** review, one summary with verdicts and `### Cross-file issues (1)`; record run URL and counts in `validation.md`
-- [ ] T090 [US7] ⚠ confirm — Re-run the workflow on the unchanged demo PR: phase log `suppressed=N inline=0`, summary edited in place, no new comment (SC-004; closes `contracts/finding-identity.md` only when observed)
-- [ ] T091 [US7] Verify the draft/fork skip live: mark the demo PR draft → `skipped` job prints the reason, `review` job skipped; mark ready → review runs (`ready_for_review`); record
+- [X] T087 [US7] GitHub live preview from this machine: `PLATFORM=github GH_REPOSITORY=vijayclarion/codereviewsample GH_CHECKLIST_REPO=vijayclarion/codereviewchecklist python -m review_agent --local --dry-run --log-llm --pr <demo PR>` → zero writes, three criterion verdicts, the cross-file finding, the checklist violation, real token counts in the log; record in `validation.md` (SC-002 GitHub half)
+- [X] T088 [US7] Hand the requester the secrets list (plan.md "Secrets") and wait until they confirm `AI_REVIEW_LLM_API_KEY` (and optionally `AI_REVIEW_BOT_TOKEN`) are set on `codereviewsample`; do not proceed, and do not work around, if they are not (FR-041)
+- [X] T089 [US7] Observe the workflow run on the demo PR (triggered by the push or by re-running): job green, inline comments on the defect lines in **one** review, one summary with verdicts and `### Cross-file issues (1)`; record run URL and counts in `validation.md`
+- [X] T090 [US7] ⚠ confirm — Re-run the workflow on the unchanged demo PR: phase log `suppressed=N inline=0`, summary edited in place, no new comment (SC-004; closes `contracts/finding-identity.md` only when observed)
+- [X] T091 [US7] Verify the draft/fork skip live: mark the demo PR draft → `skipped` job prints the reason, `review` job skipped; mark ready → review runs (`ready_for_review`); record
 - [X] T092 [US7] ⚠ confirm — Checklist repository: branch `add-gitignore`, `.gitignore` containing `.env`, push, open PR
-- [ ] T093 [US7] Secret scan of every pushed branch in all three repositories: in a scratch script, load the token values from `.env` and search `git log -p <branch>` for each value and its base64 forms; print only the count of hits per branch (expected 0); record in `validation.md`
+- [X] T093 [US7] Secret scan of every pushed branch in all three repositories: in a scratch script, load the token values from `.env` and search `git log -p <branch>` for each value and its base64 forms; print only the count of hits per branch (expected 0); record in `validation.md`
 
 ---
 
@@ -215,7 +215,7 @@ edited in place, TFS unchanged.
 - [X] T096 [P] Re-read the Call Site Ledger in `plan.md` against `git diff master --stat`; any file changed that the ledger does not list is either added to the ledger with a reason or reverted
 - [X] T097 [P] Confirm `tfs_client.py`, `dedupe.py`, `tests/fakes.py` and every pre-existing test file except `tests/conftest.py` and `tests/contract/test_import_boundaries.py` are byte-identical to `7eddb98` (`git diff --stat 7eddb98 -- <paths>`)
 - [X] T098 [P] Run `python -m tests.demo.run` (feature 003's self-contained demo) — still succeeds
-- [ ] T099 Mark spec Definition-of-Done items in `validation.md` with evidence links (run URLs, PR links, counts)
+- [X] T099 Mark spec Definition-of-Done items in `validation.md` with evidence links (run URLs, PR links, counts)
 - [ ] T100 ⚠ confirm — After the agent PR merges, switch the sample caller's `uses:` ref from `@007-github-and-cross-file` to `@master` in a follow-up PR on `codereviewsample`
 - [ ] T101 Prepare the final report (req "Report back"): changes per repository, PR links, test results, the exact secrets list, assumptions, known limitations (heuristic grouping, regex declarations, same-repository issues only, GHES untested live unless available)
 
