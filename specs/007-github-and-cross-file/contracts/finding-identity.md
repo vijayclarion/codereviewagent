@@ -54,3 +54,8 @@ from the two live runs.
    same cross-file issue (same file set) on `CartController.cs` instead of `Interfaces.cs`.
    Its fingerprint includes the anchor, so it is now also recognised when the fingerprint
    for *any* of the files it names was already posted.
+5. **A reviewed commit gets no new inline comments** (approved after attempt 7). The summary
+   records the head commit it reviewed (`<!-- ai-review:commit:<sha> -->`). A later run of the
+   **same** commit posts no new inline comment: findings that are new on that run are listed
+   in the summary under `### New on this re-review (not posted inline)`. A new push is reviewed
+   and commented normally. Applies on both platforms (TFS: the iteration's commit).

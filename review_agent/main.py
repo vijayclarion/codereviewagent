@@ -522,6 +522,7 @@ def _deliver(config, report, work_items, pr_context, reviewable, client, prior, 
             outcome="dry-run",
             inline=len(plan.inline),
             suppressed=len(plan.suppressed),
+            held=len(plan.held) or None,
             summary=plan.action.replace("_summary", ""),
         )
         return plan
@@ -531,6 +532,7 @@ def _deliver(config, report, work_items, pr_context, reviewable, client, prior, 
         "post",
         inline=posted,
         suppressed=len(plan.suppressed),
+        held=len(plan.held) or None,
         summary=plan.action.replace("_summary", ""),
     )
     return plan

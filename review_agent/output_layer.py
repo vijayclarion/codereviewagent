@@ -9,6 +9,8 @@ value is largely "what did it not find", a missing section is indistinguishable
 from a section that failed to render, and that ambiguity is expensive.
 """
 
+import re
+
 from .config import emit
 from .models import SkippedFile
 from .parser import (
@@ -96,6 +98,15 @@ def _locate(report_file, report_line, reviewable, mapper):
                 return changed.path, line
             return changed.path, None
     return None, None
+
+
+_HEX_COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def reviewed_commit_marker(pr_context):
+    """The head commit as recorded in the summary, or "" when it is not a hex SHA."""
+    commit = (getattr(pr_context, "iteration_commit", "") or "").strip().lower()
+    return commit if _HEX_COMMIT.match(commit) else ""
 
 
 def location_free_fingerprint(kind, identity):
@@ -293,7 +304,7 @@ def render_degraded_summary(reason):
     )
 
 
-def render_summary(report, work_items, pr_context, reviewable=None, summary_only=()):
+def render_summary(report, work_items, pr_context, reviewable=None, summary_only=(), held=()):
     parts = ["## \U0001F916 AI Code Review", ""]
 
     reviewed_count = len(reviewable.reviewed) if reviewable else 0
@@ -407,6 +418,20 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
         parts.append("None found.")
     parts.append("")
 
+    if held:
+        parts.append("### New on this re-review (not posted inline)")
+        parts.append("")
+        parts.append(
+            "This commit was already reviewed. These findings are new on this run and are "
+            "listed here rather than added as comments, so re-running a review never adds "
+            "comments to an unchanged commit."
+        )
+        parts.append("")
+        for comment in held:
+            headline = _headline(comment.body).strip("*")
+            parts.append(f"- `{comment.path.lstrip('/')}:{comment.right_line}` — {headline}: {_detail(comment.body)}")
+        parts.append("")
+
     if summary_only:
         parts.append("### Findings without a specific location")
         parts.append("")
@@ -437,6 +462,10 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
     # itself records that the finding was reported. Invisible when rendered;
     # read back by `dedupe.read_prior_feedback` like any other marker.
     hidden = sorted({f"<!-- {MARKER}:{kind}:{fp} -->" for kind, _p, _l, _b, fp in summary_only if fp})
+    commit = reviewed_commit_marker(pr_context)
+    if commit:
+        # Records which commit this summary reviewed (the same-commit guard).
+        hidden.append(f"<!-- {MARKER}:commit:{commit} -->")
     if hidden:
         parts.append("")
         parts.extend(hidden)
@@ -452,12 +481,15 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
 class FeedbackPlan:
     """What the run intends to do. Rendered identically in both modes."""
 
-    def __init__(self, summary_markdown, inline, summary_only, suppressed, action):
+    def __init__(self, summary_markdown, inline, summary_only, suppressed, action, held=()):
         self.summary_markdown = summary_markdown
         self.inline = tuple(inline)
         self.summary_only = tuple(summary_only)
         self.suppressed = tuple(suppressed)
         self.action = action  # "create_summary" | "update_summary"
+        #: Feature 007: new findings on a commit already reviewed - listed in the
+        #: summary, never posted inline (approved by the requester after T090).
+        self.held = tuple(held)
 
 
 #: Kinds whose findings carry no natural identifier, so an identity built from
@@ -552,9 +584,18 @@ def build_plan(report, work_items, pr_context, reviewable, mapper, prior=None):
     fresh = [c for c in inline if not seen(c)]
     suppressed = [c for c in inline if seen(c)]
 
-    summary = render_summary(report, work_items, pr_context, reviewable, summary_only)
+    # Feature 007: a commit this agent has already reviewed gets no new inline
+    # comments. The provider is not deterministic - given the identical commit
+    # again it sometimes finds something it did not before - and a re-run that
+    # keeps adding comments is noise. What it finds goes into the summary.
+    held = []
+    commit = reviewed_commit_marker(pr_context)
+    if commit and commit in posted:
+        held, fresh = fresh, []
+
+    summary = render_summary(report, work_items, pr_context, reviewable, summary_only, held=held)
     action = "update_summary" if (prior and prior.summary_thread_id) else "create_summary"
-    return FeedbackPlan(summary, fresh, summary_only, suppressed, action)
+    return FeedbackPlan(summary, fresh, summary_only, suppressed, action, held=held)
 
 
 def print_plan(plan):

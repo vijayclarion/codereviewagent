@@ -189,3 +189,44 @@ def test_a_cross_file_issue_anchored_on_another_of_its_files_is_recognised():
     run2 = output_layer.build_plan(ReviewReport(cross_file_issues=(on_controller,)), (), CTX,
                                    _reviewable_two(), map_line, _prior_from(run1))
     assert run2.inline == () and [c.kind for c in run2.suppressed] == ["cross-file"]
+
+
+# -- Same-commit guard (approved after attempt 7) -------------------------------
+
+HEX_HEAD = "f204814" + "0" * 33
+
+
+def test_a_rerun_of_a_reviewed_commit_posts_nothing_new_and_lists_it_in_the_summary():
+    from review_agent.models import CodeIssue
+
+    ctx = PullRequestContext(pr_id=3, iteration_id=2, platform="github").with_iteration(2, HEX_HEAD, "b" * 40)
+    first = CodeIssue("low", "Magic number for the discount percentage.", file=CART, line=23)
+    run1 = output_layer.build_plan(ReviewReport(code_issues=(first,)), (), ctx, _reviewable(), map_line)
+    assert len(run1.inline) == 1
+    assert f"<!-- ai-review:commit:{HEX_HEAD} -->" in run1.summary_markdown
+
+    new = CodeIssue("low", "CouponCode is duplicated on CartItem with no apparent use.", file=CART, line=24)
+    run2 = output_layer.build_plan(ReviewReport(code_issues=(first, new)), (), ctx, _reviewable(), map_line,
+                                   _prior_from(run1))
+    assert run2.inline == ()
+    assert [c.body.splitlines()[-1] for c in run2.held] == ["CouponCode is duplicated on CartItem with no apparent use."]
+    assert "### New on this re-review (not posted inline)" in run2.summary_markdown
+    assert "CouponCode is duplicated on CartItem" in run2.summary_markdown
+
+
+def test_a_new_commit_is_reviewed_and_commented_normally():
+    from review_agent.models import CodeIssue
+
+    old = PullRequestContext(pr_id=3, iteration_id=2).with_iteration(2, HEX_HEAD, "b" * 40)
+    new_head = PullRequestContext(pr_id=3, iteration_id=3).with_iteration(3, "a" * 40, "b" * 40)
+    first = CodeIssue("low", "Magic number for the discount percentage.", file=CART, line=23)
+    run1 = output_layer.build_plan(ReviewReport(code_issues=(first,)), (), old, _reviewable(), map_line)
+    new = CodeIssue("low", "CouponCode is duplicated on CartItem with no apparent use.", file=CART, line=24)
+    run2 = output_layer.build_plan(ReviewReport(code_issues=(first, new)), (), new_head, _reviewable(), map_line,
+                                   _prior_from(run1))
+    assert len(run2.inline) == 1 and run2.held == ()
+
+
+def test_a_non_hex_commit_records_no_marker():
+    ctx = PullRequestContext(pr_id=1).with_iteration(1, "head-not-a-sha", "")
+    assert output_layer.reviewed_commit_marker(ctx) == ""
