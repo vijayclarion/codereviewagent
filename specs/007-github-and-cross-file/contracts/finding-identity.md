@@ -25,3 +25,23 @@ Consequences, accepted deliberately:
 **Not considered closed by reasoning.** As 003 required for its own repair, the GitHub path is
 closed only when a second **live** posting run on the demo PR reports `suppressed=N` with
 `inline=0` and the summary edited in place (SC-004).
+
+## Amendment after the live re-run (T090, approved by the requester)
+
+The live re-run on sample PR #3 posted 2 repeats (`suppressed=5 inline=2`). Two changes,
+both applying to TFS and GitHub alike:
+
+1. **Summary-only findings are marked.** The summary carries one hidden marker
+   (`<!-- ai-review:<kind>:<fp> -->`) per finding it lists without a location, using the
+   *location-free* fingerprint `fingerprint(kind, "", identity)`. An inline comment is
+   suppressed when its own fingerprint **or** its location-free fingerprint was already
+   posted. A finding reported in the summary is therefore not posted again once a later run
+   anchors it.
+2. **Checklist findings are also matched on wording.** `checklist` joins `code` in
+   `TEXT_MATCHED_KINDS`: in the same file, prose overlap of at least 0.3 means the same
+   finding, so the provider citing a different rule for the same problem is recognised. The
+   accepted cost: two genuinely different violations worded alike in one file collapse into
+   one comment.
+
+Regression tests: `tests/unit/test_dedupe_live_repeats.py`, using the provider's own texts
+from the two live runs.

@@ -58,9 +58,13 @@ def _escape_cell(text):
 
 
 class InlineComment:
-    __slots__ = ("path", "right_line", "markdown", "fingerprint", "kind", "body")
+    __slots__ = ("path", "right_line", "markdown", "fingerprint", "kind", "body", "identity")
 
-    def __init__(self, path, right_line, markdown, fp, kind, body=""):
+    def __init__(self, path, right_line, markdown, fp, kind, body="", identity=""):
+        #: Feature 007: the stable identity the fingerprint was built from, so a
+        #: finding first reported summary-only (no path) is still recognised
+        #: once it gains a location (`location_free_fingerprint`).
+        self.identity = identity
         self.path = path
         self.right_line = right_line
         self.markdown = markdown
@@ -94,6 +98,17 @@ def _locate(report_file, report_line, reviewable, mapper):
     return None, None
 
 
+def location_free_fingerprint(kind, identity):
+    """A finding's fingerprint without its path (feature 007).
+
+    The path is part of an inline comment's fingerprint, and a finding reported
+    summary-only has none - so the two never matched, and a finding that gained
+    a location on a later run was posted as if new. This form is the same in
+    both places.
+    """
+    return fingerprint(kind, "", identity)
+
+
 def build_inline_comments(report, reviewable, mapper):
     """One comment per located finding; everything else goes to the summary.
 
@@ -116,11 +131,16 @@ def build_inline_comments(report, reviewable, mapper):
         if resolved_path and resolved_line:
             inline.append(
                 InlineComment(
-                    resolved_path, resolved_line, body + _footer(kind, fp), fp, kind, body
+                    resolved_path, resolved_line, body + _footer(kind, fp), fp, kind, body,
+                    identity=identity,
                 )
             )
         else:
-            summary_only.append((kind, path, line, body, fp))
+            # Feature 007: a summary-only finding carries its LOCATION-FREE
+            # fingerprint, which the summary publishes as a hidden marker. A
+            # later run that manages to anchor the same finding recognises it
+            # instead of posting it as new (live run T090, validation.md).
+            summary_only.append((kind, path, line, body, location_free_fingerprint(kind, identity)))
 
     for claim in report.false_coverage_claims:
         ordinal = _ordinal_for(report, claim.criterion)
@@ -413,6 +433,14 @@ def render_summary(report, work_items, pr_context, reviewable=None, summary_only
     parts.append("---")
     parts.append(DISCLAIMER)
 
+    # Feature 007: one hidden marker per summary-only finding, so the summary
+    # itself records that the finding was reported. Invisible when rendered;
+    # read back by `dedupe.read_prior_feedback` like any other marker.
+    hidden = sorted({f"<!-- {MARKER}:{kind}:{fp} -->" for kind, _p, _l, _b, fp in summary_only if fp})
+    if hidden:
+        parts.append("")
+        parts.extend(hidden)
+
     return "\n".join(parts).rstrip() + _footer()
 
 
@@ -436,7 +464,13 @@ class FeedbackPlan:
 #: what the provider reported cannot be stable (research R14). Observed live: the
 #: provider reworded every code issue AND moved the line it attributed them to
 #: between two runs against an unchanged pull request.
-TEXT_MATCHED_KINDS = ("code",)
+#:
+#: Feature 007 adds `checklist`, approved by the requester after live run T090:
+#: the provider cited "Create Unit Tests for critical parts ..." on one run and
+#: "Create unit tests" on the next for the same problem in the same file - two
+#: rule identifiers, one finding. The accepted cost: two genuinely different
+#: violations worded alike in one file collapse into one comment.
+TEXT_MATCHED_KINDS = ("code", "checklist")
 
 #: Token overlap between two findings' prose, above which they are taken to be
 #: the same finding said differently.
@@ -489,7 +523,12 @@ def build_plan(report, work_items, pr_context, reviewable, mapper, prior=None):
     posted = prior.posted_fingerprints if prior else frozenset()
 
     def seen(comment):
-        return comment.fingerprint in posted or _already_said(comment, prior)
+        if comment.fingerprint in posted:
+            return True
+        # Feature 007: reported summary-only on an earlier run, located now.
+        if comment.identity and location_free_fingerprint(comment.kind, comment.identity) in posted:
+            return True
+        return _already_said(comment, prior)
 
     fresh = [c for c in inline if not seen(c)]
     suppressed = [c for c in inline if seen(c)]
